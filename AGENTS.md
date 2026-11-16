@@ -1,7 +1,7 @@
-# Aje-Corespon — Agent Quickstart
+# Aje-Parejas — Agent Quickstart
 
-**Repo:** https://github.com/mahuca/aje-corespon  
-**Producción:** https://aje-corespon.onrender.com
+**Repo:** https://github.com/mahuca/aje-parejas  
+**Producción:** https://aje-parejas.onrender.com
 
 ---
 
@@ -129,14 +129,17 @@
 
 ## 5. Despliegue (Render)
 
-- Servicio: `aje-corespon` — plan free, región `oregon`.
+- Servicio: `aje-parejas` — plan free, región `oregon`, repo `mahuca/aje-parejas`.
 - `render.yaml`:
   - `buildCommand: npm ci --omit=dev`
   - `startCommand: node server.js`
   - `healthCheckPath: /healthz`
   - `TZ=Europe/Madrid` y `NOTIFY_PROVIDER=telegram`
-- Variables de entorno en panel Render (ver README): `DATABASE_URL`, `ADMIN_TOKEN`, `BASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
-- **No tocar `ajedrez-online`** hasta que acabe el torneo en curso (usa tablas `torneo_*`, comparte Neon).
+- Variables de entorno en el panel Render: `DATABASE_URL`, `PIN_PEPPER`, `ADMIN_TOKEN`, `BASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+- **Base de datos propia:** usa la base `aje_parejas` del proyecto Neon `ajedrez`, separada de `neondb` (la de `aje-corespon`). Aunque las tablas se llaman `corespon_*`, al estar en bases distintas no se pisan.
+- El torneo, las salas, los jugadores y las claves viven en Postgres: un despliegue o un reinicio **no** los pierde.
+- **No tocar `ajedrez-online` ni `aje-corespon`** hasta que acaben sus torneos en curso.
+- Tras cambiar una variable en Render hay que hacer **Manual Deploy → Deploy latest commit**.
 
 ---
 
