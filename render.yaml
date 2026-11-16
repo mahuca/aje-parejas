@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: aje-parejas
+    runtime: node
+    plan: free
+    # Misma región que Neon (us-west-2): menos latencia por jugada.
+    region: oregon
+    branch: main
+    buildCommand: "npm ci --omit=dev"
+    startCommand: "node server.js"
+    # Liveness sin base de datos; la readiness está en /api/status.
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: TZ
+        value: "Europe/Madrid"
+      - key: BASE_URL
+        value: "https://aje-parejas.onrender.com"
+      - key: NOTIFY_PROVIDER
+        value: "telegram"
+      # Secretos: se piden al crear el Blueprint o se ponen en el panel.
+      - key: DATABASE_URL
+        sync: false
+      - key: PIN_PEPPER
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      # Chats privados opcionales por jugador, p. ej.:
+      # - key: TELEGRAM_CHAT_MANUEL
+      #   sync: false
+      # - key: TELEGRAM_CHAT_ABUELO
+      #   sync: false

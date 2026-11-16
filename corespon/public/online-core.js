@@ -1,0 +1,408 @@
+/*
+ * Capa de red para la correspondencia.
+ *
+ * Mantiene la sesión (código + token) y la reconexión automática,
+ * usando los eventos `corespon:*` del servidor.
+ */
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'ajeCoresponSession_v1';
+  const NAME_KEY = 'ajeCoresponName_v1';
+  const REQUEST_TIMEOUT_MS = 15000;
+  const CONNECT_TIMEOUT_MS = 8000;
+
+  const socket = io({
+    autoConnect: true,
+    reconnection: true,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 4000,
+    timeout: 10000
+  });
+
+  const listeners = new Map();
+  let session = null;
+  let room = null;
+  let watching = null;
+  let autoResume = false;
+  let resumePromise = null;
+
+  // Recupera la sesión guardada al cargar la página. Sin esto, recargar
+  // obligaba a volver a entrar y la reconexión perdía el asiento.
+  session = loadSession();
+
+  // ==================== EVENTOS LOCALES ====================
+
+  function on(event, fn) {
+    if (!listeners.has(event)) listeners.set(event, new Set());
+    listeners.get(event).add(fn);
+    return () => off(event, fn);
+  }
+
+  function off(event, fn) {
+    const set = listeners.get(event);
+    if (set) set.delete(fn);
+  }
+
+  function emitLocal(event, payload) {
+    const set = listeners.get(event);
+    if (!set) return;
+    for (const fn of set) {
+      try {
+        fn(payload);
+      } catch (error) {
+        console.error('Error en listener', event, error);
+      }
+    }
+  }
+
+  // ==================== SESIÓN ====================
+
+  function loadSession() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.code !== 'string' || typeof parsed.token !== 'string') {
+        return null;
+      }
+      return {
+        code: parsed.code,
+        token: parsed.token,
+        color: parsed.color === 'black' ? 'black' : 'white',
+        name: parsed.name || ''
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function saveSession(next) {
+    if (!next || typeof next.code !== 'string' || typeof next.token !== 'string') {
+      // Sin token no hay forma de recuperar el asiento: no guardamos una
+      // sesión que luego no se podría reanudar.
+      return;
+    }
+    session = next;
+    autoResume = true;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch (error) {
+      // almacenamiento no disponible (modo privado): seguimos en memoria
+    }
+  }
+
+  function clearSession() {
+    session = null;
+    room = null;
+    autoResume = false;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (error) {
+      // almacenamiento no disponible: nada que borrar
+    }
+  }
+
+  function getName() {
+    try {
+      return localStorage.getItem(NAME_KEY) || '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function setName(name) {
+    try {
+      if (name) localStorage.setItem(NAME_KEY, name);
+    } catch (error) {
+      // nada que hacer
+    }
+  }
+
+  // ==================== TRANSPORTE ====================
+
+  function waitForConnect(timeoutMs) {
+    if (socket.connected) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        socket.off('connect', onConnect);
+        resolve(value);
+      };
+      const onConnect = () => finish(true);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      socket.on('connect', onConnect);
+    });
+  }
+
+  function send(event, payload) {
+    return new Promise((resolve) => {
+      socket.timeout(REQUEST_TIMEOUT_MS).emit(event, payload, (error, response) => {
+        if (error) return resolve({ ok: false, error: 'timeout' });
+        if (!response || typeof response !== 'object') {
+          return resolve({ ok: false, error: 'server_error' });
+        }
+        resolve(response);
+      });
+    });
+  }
+
+  function request(event, payload, wait = true) {
+    if (!socket.connected) {
+      if (!wait) return Promise.resolve({ ok: false, error: 'offline' });
+      return waitForConnect(CONNECT_TIMEOUT_MS).then((connected) => {
+        if (!connected) return { ok: false, error: 'timeout' };
+        return send(event, payload);
+      });
+    }
+    return send(event, payload);
+  }
+
+  // ==================== CONEXIÓN ====================
+
+  socket.on('connect', () => {
+    emitLocal('connection', { status: 'connected' });
+    // Tras una desconexión hay que volver a entrar en la sala: el servidor
+    // pierde el contexto del socket. Si estábamos mirando, volvemos a mirar.
+    if (watching) {
+      watch(watching);
+    } else if (autoResume && session) {
+      resume();
+    }
+  });
+
+  socket.on('disconnect', (reason) => {
+    emitLocal('connection', { status: 'disconnected', reason });
+  });
+
+  socket.io.on('reconnect_attempt', () => {
+    emitLocal('connection', { status: 'reconnecting' });
+  });
+
+  socket.io.on('reconnect_failed', () => {
+    emitLocal('connection', { status: 'offline' });
+  });
+
+  socket.on('corespon:room:update', (payload) => {
+    if (!payload || typeof payload.code !== 'string') return;
+    room = payload;
+    emitLocal('room', room);
+  });
+
+  // La sala se ha borrado desde administración.
+  socket.on('corespon:room:closed', (payload) => {
+    if (!room || !payload || payload.code !== room.code) return;
+    room = null;
+    emitLocal('closed', payload);
+  });
+
+  socket.on('corespon:extendResult', (payload) => {
+    if (!payload) return;
+    room = payload.room;
+    emitLocal('room', room);
+    emitLocal('extendResult', payload);
+  });
+
+  // La revancha intercambia los colores: el servidor avisa a cada asiento.
+  socket.on('corespon:color', (payload) => {
+    if (!payload || (payload.color !== 'white' && payload.color !== 'black')) return;
+    if (session) {
+      session.color = payload.color;
+      saveSession(session);
+    }
+    emitLocal('color', { color: payload.color, code: payload.code });
+  });
+
+  // ==================== API ====================
+
+  async function joinRoom(code, name, pin) {
+    const normalized = String(code || '').trim().toUpperCase();
+    // El token debe leerse ANTES de leaveRoom(): esa llamada limpia la sesión.
+    const token = session && session.code === normalized ? session.token : undefined;
+
+    if (watching) await stopWatching();
+    if (session && session.code !== normalized) {
+      // Cambiar de partida no es abandonar: solo se suelta el asiento
+      // anterior. La partida queda abierta para volver cuando se quiera.
+      await leaveRoom({ silent: true, resign: false });
+    }
+
+    const response = await request('corespon:join', {
+      code: normalized,
+      token,
+      name,
+      pin: pin || undefined
+    });
+    if (!response.ok) return response;
+
+    room = response.room;
+    saveSession({
+      code: response.code || response.room.code,
+      token: response.token,
+      color: response.color,
+      name: name || (session ? session.name : '')
+    });
+    emitLocal('joined', response);
+    emitLocal('room', room);
+    return response;
+  }
+
+  async function leaveRoom(options = {}) {
+    const hadSession = !!session;
+    const resign = options.resign !== false;
+    if (hadSession && socket.connected) {
+      await request('corespon:leave', {
+        code: session.code,
+        color: session.color,
+        resign
+      }, false);
+    }
+    if (watching) await stopWatching();
+    clearSession();
+    if (!options.silent) emitLocal('left');
+    return { ok: true };
+  }
+
+  async function sendMove(from, to, promotion) {
+    if (!session) return { ok: false, error: 'no_session' };
+    if (!socket.connected) return { ok: false, error: 'offline' };
+    // La sala que se está viendo manda: evita enviar la jugada a la última
+    // partida guardada si hay varias abiertas.
+    const code = room && room.code ? room.code : session.code;
+    return request('corespon:move', { code, color: session.color, from, to, promotion });
+  }
+
+  async function extendRoom(code, color) {
+    if (!session) return { ok: false, error: 'no_session' };
+    return request('corespon:extend', { code, color });
+  }
+
+  async function resign(code, color) {
+    if (!session) return { ok: false, error: 'no_session' };
+    return request('corespon:resign', { code, color });
+  }
+
+  async function offerDraw(code) {
+    if (!session) return { ok: false, error: 'no_session' };
+    return request('corespon:draw', { code, color: session.color });
+  }
+
+  async function acceptDraw(code) {
+    if (!session) return { ok: false, error: 'no_session' };
+    return request('corespon:draw:accept', { code, color: session.color });
+  }
+
+  async function declineDraw(code) {
+    if (!session) return { ok: false, error: 'no_session' };
+    return request('corespon:draw:decline', { code, color: session.color });
+  }
+
+  async function watch(code) {
+    const normalized = String(code || '').trim().toUpperCase();
+    const response = await request('corespon:watch', { code: normalized });
+    if (!response.ok) {
+      if (response.error === 'not_found') watching = null;
+      return response;
+    }
+
+    watching = normalized;
+    room = response.room;
+    emitLocal('room', room);
+    return response;
+  }
+
+  async function stopWatching() {
+    const code = watching;
+    watching = null;
+    if (!code || !socket.connected) return Promise.resolve({ ok: true });
+    return request('corespon:unwatch', { code }, false);
+  }
+
+  async function resume() {
+    if (!session) return { ok: false, error: 'no_session' };
+    if (resumePromise) return resumePromise;
+
+    const playerName = session.name || getName();
+    resumePromise = (async () => {
+      const response = await request('corespon:join', {
+        code: session.code,
+        token: session.token,
+        name: playerName
+      });
+
+      if (response.ok) {
+        room = response.room;
+        saveSession({
+          code: response.code || response.room.code,
+          token: response.token,
+          color: response.color,
+          name: playerName
+        });
+        emitLocal('joined', { ...response, resumed: true });
+        emitLocal('room', room);
+        return response;
+      }
+
+      if (response.error === 'not_found' || response.error === 'invalid_code'
+          || response.error === 'full') {
+        clearSession();
+        emitLocal('session-lost', response);
+        return response;
+      }
+
+      // El token guardado ya no vale (p. ej. tras cerrar las sesiones
+      // abiertas) o hace falta la clave: al lobby con el código puesto para
+      // escribirla. También si el alta de claves está cerrada.
+      if (response.error === 'pin_requerido' || response.error === 'pin_incorrecto'
+          || response.error === 'pin_invalido' || response.error === 'alta_cerrada') {
+        const code = session.code;
+        clearSession();
+        emitLocal('pin-required', { ...response, code, name: playerName });
+      }
+
+      return response;
+    })();
+
+    try {
+      return await resumePromise;
+    } finally {
+      resumePromise = null;
+    }
+  }
+
+  window.CoresponOnline = {
+    on,
+    off,
+    getSession: () => (session ? { ...session } : null),
+    setSession: (s) => { saveSession(s); },
+    clearSession,
+    getName,
+    setName,
+    isConnected: () => socket.connected,
+    getColor: () => (session ? session.color : null),
+    getRoom: () => room,
+    enableAutoResume: () => {
+      autoResume = true;
+      if (socket.connected && session) resume();
+    },
+    resume,
+    joinRoom,
+    leaveRoom,
+    sendMove,
+    extendRoom,
+    resign,
+    offerDraw,
+    acceptDraw,
+    declineDraw,
+    watch,
+    stopWatching,
+    reconnect: () => {
+      if (!socket.connected) socket.connect();
+    }
+  };
+
+  window.Online = window.CoresponOnline;
+})();

@@ -1,0 +1,1901 @@
+'use strict';
+
+/*
+ * Servidor de ajedrez por correspondencia.
+ *
+ * Flujo de una jugada:
+ *  1. El cliente envía `corespon:move` con origen, destino y pieza de promoción.
+ *  2. El servidor valida que es el turno del jugador y que la jugada es legal
+ *     con el motor `shared/engine.js`.
+ *  3. Si es legal, actualiza el estado, guarda el PGN en la base de datos,
+ *     avanza el plazo y emite `corespon:room:update` a toda la sala.
+ *  4. Si caduca el plazo sin jugada → derrota por tiempo.
+ */
+
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+const express = require('express');
+const { Server } = require('socket.io');
+const engine = require('../shared/engine');
+const { loadEnv } = require('./env');
+
+loadEnv();
+
+const { RoomManager, Room, normalizeCode, sameName, PLAZO_DEFAULT_MS, GRACIA_DEFAULT_MS, MAX_PRORROGAS, buildPgn } = require('./rooms');
+const { createStore } = require('./db');
+const { computeClassification, RATING_INICIAL } = require('./classification');
+const {
+  TelegramGateway, INVITACION, TURNO, RECORDATORIO, PRORROGA, TIEMPO, FIN, VUELTA,
+  PAREJAS, invitacionMsg, turnoMsg, recordatorioMsg, prorrogaMsg, tiempoMsg, finMsg,
+  vueltaMsg, parejasMsg
+} = require('./telegram');
+const { crearTorneoManager } = require('./torneo');
+
+const CLEANUP_INTERVAL_MS = 60 * 1000;
+const CHECK_DEADLINE_MS = 60 * 1000;
+const CHECK_RECORDATORIO_MS = 30 * 60 * 1000;
+
+function trimSlash(value) {
+  return String(value || '').replace(/\/+$/, '');
+}
+
+function createServer(options = {}) {
+  const quiet = !!options.quiet;
+  let currentPort = Number(options.port) || Number(process.env.PORT) || 3001;
+  const log = (...args) => {
+    if (!quiet) console.log('[corespon]', ...args);
+  };
+
+  /*
+   * URL pública de la aplicación.
+   *
+   * - `BASE_URL` (recomendado en producción) tiene prioridad.
+   * - Con una petición HTTP de Express se usa `protocol` + `Host`.
+   * - Con un socket se leen las cabeceras del handshake, porque
+   *   `socket.request` es un IncomingMessage crudo sin los ayudantes de Express.
+   * - Sin contexto (temporizadores) se usa el último puerto de escucha.
+   */
+  function baseUrl(reqOrSocket) {
+    if (process.env.BASE_URL) return trimSlash(process.env.BASE_URL);
+
+    if (reqOrSocket && typeof reqOrSocket.get === 'function'
+        && typeof reqOrSocket.protocol === 'string') {
+      const host = reqOrSocket.get('host');
+      if (host) return trimSlash(reqOrSocket.protocol + '://' + host);
+    }
+
+    const handshake = reqOrSocket && reqOrSocket.handshake;
+    if (handshake) {
+      const headers = handshake.headers || {};
+      const proto = String(headers['x-forwarded-proto'] || '').split(',')[0].trim()
+        || (handshake.secure ? 'https' : 'http');
+      const host = String(headers['x-forwarded-host'] || headers.host || '').split(',')[0].trim();
+      if (host) return trimSlash(proto + '://' + host);
+    }
+
+    return trimSlash(options.baseUrl || 'http://localhost:' + currentPort);
+  }
+
+  const app = express();
+  const server = http.createServer(app);
+  const io = new Server(server, {
+    pingInterval: 30000,
+    pingTimeout: 25000,
+    maxHttpBufferSize: 200 * 1024
+  });
+
+  const rooms = new RoomManager();
+  const store = options.store || createStore({ quiet });
+  const gateway = options.gateway || new TelegramGateway({ store, debug: !quiet });
+  const timers = [];
+
+  /*
+   * Torneo de parejas (knockout). El manager guarda su estado en
+   * `corespon_ajustes` y crea salas reales reutilizando RoomManager.
+   */
+  const torneo = crearTorneoManager({
+    store,
+    crearSala: crearSalaTorneo,
+    abrirAlta: abrirAltaClaves,
+    elegirBye: elegirByeMejorClasificado,
+    log
+  });
+
+  // Registrar los jugadores invitados por defecto
+  const JUGADORES_POR_DEFECTO = ['Manuel', 'Fernan', 'Alberto', 'Alvaro', 'Alejandro', 'Abuelo'];
+  const ADMINISTRADORES = ['Abuelo'];
+  // Se guarda la promesa para esperarla antes de reparar vueltas: la baja de
+  // un jugador decide si se crea o no la partida de vuelta.
+  const rosterListo = store.initRoster(JUGADORES_POR_DEFECTO, ADMINISTRADORES);
+  rosterListo.catch((error) => {
+    if (!quiet) console.error('[corespon] Error registrando jugadores:', error.message);
+  });
+
+  const publicDir = path.join(__dirname, '..', 'public');
+  const sharedDir = path.join(__dirname, '..', 'shared');
+
+  app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+      + "img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'"
+    );
+    next();
+  });
+
+  // Sin caché: los ficheros se revalidan con ETag en cada carga (304 barato).
+  // Con `maxAge: '5m'` el navegador podía seguir usando JS viejo justo después
+  // de un despliegue y la app parecía rota sin motivo.
+  app.use(express.static(publicDir, { index: false, maxAge: 0 }));
+  app.use('/shared', express.static(sharedDir, { maxAge: 0 }));
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
+
+  const coresponFile = path.join(publicDir, 'corespon.html');
+  const parejasFile = path.join(publicDir, 'parejas.html');
+
+  // ============================ API REST ============================
+
+  app.get('/api/players', async (req, res) => {
+    try {
+      const players = await store.getPlayers();
+      res.json({ ok: true, players: players.filter(p => p.activa).map(p => ({
+        id: p.id, nombre: p.nombre, telegram: p.telegram, admin: !!p.admin
+      })) });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.post('/api/players/:id/telegram', async (req, res) => {
+    try {
+      const player = await store.updatePlayer(req.params.id, { telegram: req.body.telegram });
+      if (!player) return res.status(404).json({ ok: false, error: 'jugador no encontrado' });
+      res.json({ ok: true, player });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.get('/api/partidas', async (req, res) => {
+    try {
+      const partidas = await store.getPartidasAbiertas();
+      res.json({ ok: true, partidas: partidas.map(p => ({
+        roomCode: p.roomCode, blancas: p.blancas, negras: p.negras,
+        turno: p.turno, plazoHasta: p.plazoHasta, creadoEn: p.creadoEn
+      })) });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.get('/api/partidas/:code', async (req, res) => {
+    try {
+      const partida = await store.getPartidaPorCodigo(req.params.code);
+      if (!partida) return res.status(404).json({ ok: false, error: 'partida no encontrada' });
+      res.json({ ok: true, partida });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Borrado administrativo de una partida (pruebas, salas atascadas…).
+   * No genera resultado ni afecta a la clasificación.
+   */
+  app.delete('/api/partidas/:code', async (req, res) => {
+    try {
+      const adminToken = process.env.ADMIN_TOKEN;
+      if (!adminToken || req.get('x-admin-token') !== adminToken) {
+        return res.status(401).json({ ok: false, error: 'No autorizado' });
+      }
+
+      const code = normalizeCode(req.params.code);
+      if (!code) {
+        return res.status(400).json({ ok: false, error: 'Código inválido' });
+      }
+
+      const room = rooms.removeRoom(code);
+      await store.deletePartida(code);
+      if (room) io.to(code).emit('corespon:room:closed', { code });
+
+      res.json({ ok: true, code, estabaEnMemoria: !!room });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  // Crear una invitación de partida
+  app.post('/api/partidas/invitar', async (req, res) => {
+    try {
+      // Formato nuevo: { jugador, rival, color } donde `color` es el color del
+      // creador. Se mantiene el formato { blancas, negras } por compatibilidad.
+      const color = req.body.color === 'black' ? 'black' : 'white';
+      const jugador = req.body.jugador;
+      const rival = req.body.rival;
+
+      let blancas = req.body.blancas;
+      let negras = req.body.negras;
+      if (jugador && rival) {
+        blancas = color === 'black' ? rival : jugador;
+        negras = color === 'black' ? jugador : rival;
+      }
+
+      if (!blancas || !negras) {
+        return res.status(400).json({ ok: false, error: 'Se necesitan blancas y negras' });
+      }
+      if (sameName(blancas, negras)) {
+        return res.status(400).json({ ok: false, error: 'Un jugador no puede jugar contra sí mismo' });
+      }
+
+      // Quien crea la partida tiene que identificarse con su clave personal:
+      // así nadie puede abrir una partida en nombre de otro.
+      const solicitante = jugador || blancas;
+      const pin = await verificarPinJugador(solicitante, req.body.pin);
+      if (!pin.ok) {
+        const status = pin.error === 'rate_limited' ? 429
+          : pin.error === 'pin_invalido' ? 400 : 401;
+        return res.status(status).json({ ok: false, error: pin.error });
+      }
+
+      // Color del creador (el que hace la petición).
+      const colorCreador = color;
+
+      const roster = await store.getPlayers();
+      const blancoObj = roster.find(p => sameName(p.nombre, blancas));
+      const negroObj = roster.find(p => sameName(p.nombre, negras));
+
+      const whiteName = blancoObj ? blancoObj.nombre : blancas;
+      const blackName = negroObj ? negroObj.nombre : negras;
+
+      // Registrar jugadores si no existen
+      for (const [obj, nombre] of [[blancoObj, blancas], [negroObj, negras]]) {
+        if (!obj) {
+          await store.savePlayer({
+            id: nombre.toLowerCase(),
+            nombre: nombre,
+            activa: true,
+            admin: false,
+            telegram: null
+          });
+        }
+      }
+
+      // Verificar que no haya partida abierta entre ellos, en cualquier orden
+      const abiertas = await store.getPartidasAbiertas();
+      const existente = abiertas.find(p =>
+        (sameName(p.blancas, blancas) && sameName(p.negras, negras)) ||
+        (sameName(p.blancas, negras) && sameName(p.negras, blancas))
+      );
+      if (existente) {
+        const colorExistente = sameName(existente.blancas, solicitante) ? 'white' : 'black';
+        return res.json({
+          ok: true,
+          color: colorExistente,
+          room: { code: existente.roomCode },
+          existing: true
+        });
+      }
+
+      const room = rooms.createRoom(whiteName, blackName);
+      const asientoCreador = room.players[colorCreador];
+      asientoCreador.token = crypto.randomUUID();
+      asientoCreador.joinedAt = Date.now();
+      // no marcar connected aquí: el cliente se conectará por socket
+
+      // Guardar en DB (incluye el snapshot completo para poder restaurar)
+      await persistRoom(room);
+
+      // Invitar al jugador del color contrario al del creador. El gateway
+      // decide si el canal necesita teléfono y si está configurado.
+      const host = baseUrl(req);
+      const colorInvitado = colorCreador === 'white' ? 'black' : 'white';
+      const invitado = colorInvitado === 'white'
+        ? { nombre: whiteName, telegram: blancoObj && blancoObj.telegram }
+        : { nombre: blackName, telegram: negroObj && negroObj.telegram };
+
+      gateway.enqueue(
+        room.code, INVITACION,
+        invitado, invitacionMsg(room, colorInvitado, host), host
+      );
+
+      res.json({
+        ok: true,
+        color: colorCreador,
+        room: room.toPublic()
+      });
+    } catch (error) {
+      log('Error creando invitación:', error);
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  // ============================ SOCKET.IO ============================
+
+  const tokenMap = new Map();
+
+  io.on('connection', (socket) => {
+    socket.on('corespon:join', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const color = room.colorForName(data.name);
+      if (!color) {
+        return respond({ ok: false, error: 'not_your_game' });
+      }
+
+      const player = room.players[color];
+      const isReconnect = !!(data.token && player.token && data.token === player.token);
+
+      // El asiento ya está ocupado por otro socket (no es este cliente)
+      if (player.connected && !isReconnect) {
+        return respond({ ok: false, error: 'seat_taken' });
+      }
+
+      // Identidad: reconectar con el token del asiento prueba que ya eras tú.
+      // Si no, hay que escribir la clave personal del jugador, que evita que
+      // cualquiera entre con el nombre de otro y mueva por él.
+      let pinGuardado = false;
+      if (!isReconnect) {
+        const pin = await verificarPinJugador(data.name, data.pin);
+        if (!pin.ok) return respond({ ok: false, error: pin.error });
+        pinGuardado = pin.guardada;
+      }
+
+      // Si este socket estaba en otra sala, desconecta aquel asiento sin
+      // rendirlo: cambiar de partida no es abandonar.
+      const anterior = socket.data && socket.data.corespon;
+      if (anterior && anterior.code && anterior.code !== room.code) {
+        socket.leave(anterior.code);
+        const salaAnterior = rooms.getRoom(anterior.code);
+        if (salaAnterior) {
+          const asientoAnterior = salaAnterior.players[anterior.color];
+          if (asientoAnterior && asientoAnterior.socketId === socket.id) {
+            asientoAnterior.connected = false;
+            asientoAnterior.socketId = null;
+            await persistRoom(salaAnterior);
+            io.to(salaAnterior.code).emit('corespon:room:update', salaAnterior.toPublic());
+          }
+        }
+      }
+
+      // Si estaba viendo otra partida como espectador, deja de verla.
+      if (socket.data.spectator) {
+        const watchedCode = socket.data.spectator;
+        const watched = rooms.getRoom(watchedCode);
+        if (watched) watched.spectators.delete(socket.id);
+        socket.leave(watchedCode);
+        socket.data.spectator = null;
+      }
+
+      const primeraVez = !player.joinedAt;
+      player.token = player.token || crypto.randomUUID();
+      player.connected = true;
+      player.joinedAt = player.joinedAt || Date.now();
+      // El socket que ocupa el asiento ahora mismo. Un socket anterior deja
+      // de poder mover/rendirse porque socketContext() valida este id.
+      player.socketId = socket.id;
+      socket.data.corespon = { code: room.code, color };
+
+      tokenMap.set(player.token, room.code);
+
+      // La partida empieza cuando los dos han entrado: el plazo corre desde
+      // ese momento, no desde que se creó la sala.
+      if (!room.status.over && primeraVez
+          && room.players.white.joinedAt && room.players.black.joinedAt) {
+        const ahora = Date.now();
+        room.plazos.plazoHasta = ahora + room.plazos.plazoMs;
+        room.plazos.graciaHasta = room.plazos.plazoHasta + room.plazos.graciaMs;
+        room.plazos.recordado = false;
+        room.plazos.avisadoCaducidad = false;
+      }
+
+      // Avisar al jugador al que le toca mover solo la primera vez que el
+      // rival entra; las reconexiones no deben repetir el aviso.
+      if (!room.status.over && primeraVez) {
+        const turno = room.turnColor();
+        const turnoPlayer = room.players[turno];
+        if (turno !== color && turnoPlayer && turnoPlayer.joinedAt) {
+          const host = baseUrl(socket);
+          gateway.enqueue(room.code, TURNO, turnoPlayer, turnoMsg(room, turno, host), host);
+        }
+      }
+
+      if (!room.status.over && bothConnected(room)) room.timing.runningSince = Date.now();
+
+      await persistRoom(room);
+
+      socket.join(room.code);
+      // Avisar al rival de que el asiento ha vuelto a conectarse.
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+      respond({
+        ok: true,
+        code: room.code,
+        room: room.toPublic(),
+        color,
+        token: player.token,
+        resumed: isReconnect,
+        pinGuardado
+      });
+    });
+
+    socket.on('corespon:leave', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: true });
+
+      const color = socketContext(socket, room) ? socket.data.corespon.color : data.color;
+      const asiento = room.players[color];
+      if (asiento && asiento.socketId === socket.id) {
+        // Solo se rinde cuando el cliente lo pide expresamente (botón
+        // «Abandonar»). Cambiar de partida o volver a la lista usa
+        // `resign:false` y deja la partida abierta.
+        const debeRendirse = data.resign !== false;
+        const enCurso = !room.status.over
+          && room.players.white && room.players.black
+          && room.players.white.joinedAt && room.players.black.joinedAt;
+
+        // Suelta el asiento antes de guardar/emitir para que el rival vea
+        // el estado real de conexión.
+        asiento.connected = false;
+        asiento.socketId = null;
+        tokenMap.delete(asiento.token);
+        socket.data.corespon = null;
+        socket.leave(room.code);
+
+        if (enCurso && debeRendirse) {
+          room.rendir(color);
+          await persistRoom(room);
+          io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+          notificarFin(room, baseUrl(socket));
+        } else {
+          await persistRoom(room);
+          io.to(room.code).emit('corespon:room:update', room.toPublic());
+        }
+      }
+
+      respond({ ok: true });
+    });
+
+    socket.on('corespon:watch', (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      // Si estaba viendo otra sala, deja de recibir sus actualizaciones.
+      if (socket.data.spectator && socket.data.spectator !== room.code) {
+        const anterior = rooms.getRoom(socket.data.spectator);
+        if (anterior) anterior.spectators.delete(socket.id);
+        socket.leave(socket.data.spectator);
+      }
+
+      socket.data.spectator = room.code;
+      room.spectators.add(socket.id);
+      socket.join(room.code);
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    socket.on('corespon:unwatch', (data, respond) => {
+      const code = normalizeCode(data.code);
+      const room = rooms.getRoom(code);
+      if (room) room.spectators.delete(socket.id);
+      if (code) socket.leave(code);
+      if (socket.data) socket.data.spectator = null;
+      respond({ ok: true });
+    });
+
+    // Movimiento
+    socket.on('corespon:move', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+      if (ctx.color !== room.turnColor()) {
+        return respond({ ok: false, error: 'not_your_turn' });
+      }
+
+      const result = room.aplicarJugada(data.from, data.to, data.promotion);
+
+      if (!result.ok) {
+        return respond(result);
+      }
+
+      await persistRoom(room);
+
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+      if (!room.status.over) {
+        const host = baseUrl(socket);
+        // Le toca mover al jugador de turnColor(): ese es al que se avisa.
+        gateway.enqueue(room.code, TURNO, room.players[room.turnColor()], turnoMsg(room, room.turnColor(), host), host);
+      } else {
+        notificarFin(room, baseUrl(socket));
+      }
+
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    // Prórroga
+    socket.on('corespon:extend', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+      if (ctx.color !== room.turnColor()) {
+        return respond({ ok: false, error: 'not_your_turn' });
+      }
+
+      const result = room.extenderPlazo(ctx.color);
+      if (result.ok) {
+        await persistRoom(room);
+        // Registro histórico de la prórroga (auditoría)
+        store.addProrroga({
+          roomCode: room.code,
+          jugador: result.registro.jugador,
+          motivo: result.registro.motivo || 'solicitud',
+          solicitadoEn: result.registro.solicitadoEn,
+          concedidaEn: new Date().toISOString(),
+          nuevaFecha: result.registro.nuevaFecha
+        }).catch((error) => {
+          if (!quiet) console.error('[corespon] Error guardando la prórroga', room.code + ':', error.message);
+        });
+        io.to(room.code).emit('corespon:room:update', room.toPublic());
+        const host = baseUrl(socket);
+        gateway.enqueue(room.code, PRORROGA, room.players[room.turnColor()], prorrogaMsg(room, room.turnColor(), host), host);
+        respond(result);
+      } else {
+        respond(result);
+      }
+    });
+
+    // Rendición
+    socket.on('corespon:resign', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+      if (room.status.over) {
+        return respond({ ok: false, error: 'game_over' });
+      }
+
+      room.rendir(ctx.color);
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+      notificarFin(room, baseUrl(socket));
+
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    // Tablas por acuerdo: uno propone y el otro acepta o rechaza.
+    socket.on('corespon:draw', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data && data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+
+      const result = room.ofrecerTablas(ctx.color);
+      if (!result.ok) return respond(result);
+
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+      respond({ ok: true, offer: result.offer, already: result.already });
+    });
+
+    socket.on('corespon:draw:accept', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data && data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+
+      const result = room.aceptarTablas(ctx.color);
+      if (!result.ok) return respond(result);
+
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+      notificarFin(room, baseUrl(socket));
+
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    socket.on('corespon:draw:decline', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data && data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+
+      const ctx = socketContext(socket, room);
+      if (!ctx || !ctx.player.connected) {
+        return respond({ ok: false, error: 'not_in_room' });
+      }
+
+      const result = room.rechazarTablas(ctx.color);
+      if (!result.ok) return respond(result);
+
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    /*
+     * Vuelta del torneo. Ya no depende de votos: se crea sola al terminar la
+     * partida. Este evento se mantiene para clientes con la página cacheada
+     * (y como recuperación de partidas terminadas antes del cambio).
+     */
+    socket.on('corespon:rematch', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data && data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+      if (!room.status.over) return respond({ ok: false, error: 'not_finished' });
+
+      // Asegurar el resultado de la partida terminada antes de reiniciar.
+      await registrarResultado(room);
+
+      const creada = await crearVuelta(room, baseUrl(socket));
+      if (!creada) {
+        return respond({
+          ok: false,
+          error: room.parentCode || room.vueltaCreada ? 'auto' : 'waiting_player'
+        });
+      }
+
+      respond({ ok: true, started: true, room: room.toPublic() });
+    });
+
+    // Reconexión
+    socket.on('corespon:reconnect', (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data.code));
+      if (!room) {
+        return respond({ ok: false, error: 'not_found' });
+      }
+      socket.id.roomCode = room.code;
+      socket.join(room.code);
+      respond({ ok: true, room: room.toPublic() });
+    });
+
+    socket.on('disconnect', async () => {
+      if (socket.data && socket.data.spectator) {
+        const watching = rooms.getRoom(socket.data.spectator);
+        if (watching) watching.spectators.delete(socket.id);
+        socket.data.spectator = null;
+      }
+
+      const ctx = socket.data && socket.data.corespon;
+      if (ctx && ctx.code) {
+        const room = rooms.getRoom(ctx.code);
+        if (room) {
+          const player = room.players[ctx.color];
+          if (player && player.socketId === socket.id) {
+            player.connected = false;
+            player.socketId = null;
+            if (bothConnected(room)) room.timing.runningSince = null;
+            await persistRoom(room);
+            // El rival debe ver que este jugador se ha desconectado, sin
+            // bloquear la partida: puede seguir jugando cuando le toque.
+            if (!room.status.over) {
+              io.to(room.code).emit('corespon:room:update', room.toPublic());
+            }
+          }
+        }
+      }
+    });
+  });
+
+  // ============================ TASKS ASÍNCRONOS ============================
+
+  // 1. Revisar plazos caducados → derrota por tiempo
+  timers.push(setInterval(async () => {
+    const now = Date.now();
+    const perdidas = rooms.checkDeadlines(now);
+    for (const room of perdidas) {
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+      const loser = room.turnColor();
+      const winner = loser === 'white' ? 'black' : 'white';
+      const host = baseUrl();
+      gateway.enqueue(room.code, TIEMPO, room.players[loser], tiempoMsg(room, loser, host), host);
+      notificarFin(room, host);
+    }
+  }, CHECK_DEADLINE_MS));
+
+  // 2. Recordatorios
+  timers.push(setInterval(async () => {
+    const salas = rooms.needReminder();
+    for (const room of salas) {
+      const host = baseUrl();
+      gateway.enqueue(room.code, RECORDATORIO, room.players[room.turnColor()], recordatorioMsg(room, room.turnColor(), host), host);
+    }
+  }, CHECK_RECORDATORIO_MS));
+
+  // 3. Limpieza
+  timers.push(setInterval(() => {
+    const removed = rooms.cleanup();
+    for (const code of removed) log('Sala eliminada (vacía):', code);
+  }, CLEANUP_INTERVAL_MS));
+
+  // 4. Procesa colas de Telegram
+  timers.push(setInterval(() => {
+    gateway.processQueue(50)
+      .then((res) => {
+        if (res.processed) log('Notificaciones procesadas:', res.processed);
+      })
+      .catch((error) => {
+        if (!quiet) console.error('[corespon] Error procesando notificaciones:', error.message);
+      });
+  }, 60 * 1000));
+
+  // ============================ RUTAS + SERVIDOR ============================
+
+  app.get('/corespon', (req, res) => res.sendFile(coresponFile));
+  app.get('/corespon/:code', (req, res) => res.sendFile(coresponFile));
+
+  // Panel del torneo de parejas (sorteo, cuadro y campeón).
+  app.get('/parejas', (req, res) => res.sendFile(parejasFile));
+  app.get('/', (req, res) => res.redirect('/parejas'));
+
+  /*
+   * Visibilidad de la cola: ?estado=pendiente|enviado|fallido y recuento por
+   * estado. Si existe ADMIN_TOKEN, exige la cabecera x-admin-token.
+   */
+  app.get('/api/telegram/queue', async (req, res) => {
+    try {
+      const adminToken = process.env.ADMIN_TOKEN;
+      if (adminToken && req.get('x-admin-token') !== adminToken) {
+        return res.status(401).json({ ok: false, error: 'No autorizado' });
+      }
+
+      const estados = ['pendiente', 'enviado', 'fallido'];
+      const filtro = estados.includes(req.query.estado) ? req.query.estado : null;
+      const [notificaciones, resumen] = await Promise.all([
+        store.getNotificacionesRecientes(100, filtro),
+        store.resumenNotificaciones()
+      ]);
+      res.json({ ok: true, estado: filtro || 'todas', resumen, notificaciones });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  // Liveness para Render: no toca la base de datos, así una caída de Neon no
+  // provoca reinicios en bucle. La readiness real está en /api/status.
+  app.get('/healthz', (req, res) => {
+    res.json({
+      ok: true,
+      servicio: 'aje-corespon',
+      uptime: Math.round(process.uptime()),
+      storage: store.kind || 'memory'
+    });
+  });
+
+  app.get('/api/status', async (req, res) => {
+    try {
+      const stats = await store.obtenerEstadisticas();
+      res.json({ ok: true, estadisticas: stats });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.get('/api/classification', async (req, res) => {
+    try {
+      const [resultados, jugadores] = await Promise.all([
+        store.getResultados(),
+        store.getPlayers()
+      ]);
+      res.json({
+        ok: true,
+        clasificacion: computeClassification(resultados, jugadores.filter(p => p.activa))
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  // ============================ TORNEO ============================
+
+  // Formato: round-robin (todos contra todos) con 2 partidas por pareja.
+  // El número de jugadores no es fijo: se calcula con los jugadores activos,
+  // así que n jugadores implican n * (n - 1) partidas (6 jugadores → 30).
+  const PARTIDAS_POR_PAREJA = 2;
+
+  function resumenTorneo(jugadoresActivos, partidasJugadas) {
+    const numeroJugadores = jugadoresActivos.length;
+    const totalParejas = (numeroJugadores * (numeroJugadores - 1)) / 2;
+    const totalPartidas = totalParejas * PARTIDAS_POR_PAREJA;
+
+    const descripcion = numeroJugadores < 2
+      ? 'Hacen falta al menos 2 jugadores para empezar el torneo'
+      : `Round-robin: ${numeroJugadores} jugadores, ${totalParejas} parejas × `
+        + `${PARTIDAS_POR_PAREJA} partidas = ${totalPartidas} partidas totales`;
+
+    return {
+      formato: 'round-robin',
+      numeroJugadores,
+      totalParejas,
+      partidasPorPareja: PARTIDAS_POR_PAREJA,
+      totalPartidas,
+      partidasJugadas,
+      partidasPendientes: Math.max(0, totalPartidas - partidasJugadas),
+      descripcion,
+      jugadores: jugadoresActivos.map(p => ({ id: p.id, nombre: p.nombre }))
+    };
+  }
+
+  /*
+   * Resumen del torneo. Solo lectura: no crea ni modifica nada, así que
+   * puede consultarse siempre y no altera el despliegue en Render.
+   */
+  async function enviarResumenTorneo(req, res) {
+    try {
+      const [jugadores, parejas] = await Promise.all([
+        store.getPlayers(),
+        torneo.obtenerActual()
+      ]);
+      const activos = (jugadores || []).filter(p => p.activa);
+
+      // Este resumen alimenta el cartel del lobby. El formato del torneo es
+      // knockout de parejas: no se calculan las n × (n − 1) partidas del
+      // round-robin antiguo.
+      if (parejas) {
+        const jugadas = parejas.partidas.filter(
+          p => p.estado === 'ganada' || p.estado === 'tablas'
+        ).length;
+        const estadoTexto = parejas.estado === 'finalizado'
+          ? `campeón: ${parejas.campeon || '—'}`
+          : `ronda ${parejas.ronda} · ${parejas.partidasPendientes} partida(s) pendiente(s)`;
+        return res.json({
+          ok: true,
+          formato: 'knockout',
+          numeroJugadores: parejas.jugadores.length,
+          totalPartidas: parejas.partidas.length,
+          partidasJugadas: jugadas,
+          partidasPendientes: parejas.partidasPendientes,
+          ronda: parejas.ronda,
+          estado: parejas.estado,
+          campeon: parejas.campeon || null,
+          descripcion: `Torneo knockout: ${parejas.jugadores.length} jugadores · ${estadoTexto}`,
+          jugadores: parejas.jugadores.map(j => ({ id: j.id, nombre: j.nombre }))
+        });
+      }
+
+      res.json({
+        ok: true,
+        formato: 'knockout',
+        numeroJugadores: activos.length,
+        totalPartidas: 0,
+        partidasJugadas: 0,
+        partidasPendientes: 0,
+        descripcion: 'Todavía no hay torneo de parejas. Créalo en /parejas.',
+        jugadores: activos.map(p => ({ id: p.id, nombre: p.nombre }))
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+
+  app.get('/api/tournament', enviarResumenTorneo);
+  app.get('/api/tournament/start', enviarResumenTorneo);
+
+  // --- Torneo de parejas (formato knockout) ---
+
+  app.get('/api/parejas/torneos', async (req, res) => {
+    try {
+      res.json({ ok: true, torneos: await torneo.listar() });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.get('/api/parejas/torneos/actual', async (req, res) => {
+    try {
+      res.json({ ok: true, torneo: await torneo.obtenerActual() });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.get('/api/parejas/torneos/:id', async (req, res) => {
+    try {
+      const encontrado = await torneo.obtener(req.params.id);
+      if (!encontrado) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
+      res.json({ ok: true, torneo: encontrado });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.post('/api/parejas/torneos', async (req, res) => {
+    if (!esAdmin(req)) {
+      return res.status(401).json({ ok: false, error: 'No autorizado' });
+    }
+    const body = req.body || {};
+    const nombres = Array.isArray(body.nombres) ? body.nombres
+      : Array.isArray(body.jugadores) ? body.jugadores
+      : typeof body.jugadores === 'string' ? body.jugadores.split(/[,;\n]/)
+      : [];
+
+    try {
+      const creado = await torneo.crearTorneo({
+        nombre: body.nombre,
+        nombres,
+        horasAlta: body.horasAlta,
+        forzar: body.forzar === true || body.forzar === 'true'
+      });
+      res.status(201).json({ ok: true, torneo: creado });
+    } catch (error) {
+      const status = error.code === 'torneo_en_curso' ? 409 : 400;
+      res.status(status).json({ ok: false, error: error.message, codigo: error.code || 'error' });
+    }
+  });
+
+  app.get('/api/parejas/jugador/:nombre', async (req, res) => {
+    try {
+      const partidas = await torneo.partidasDeJugador(req.params.nombre);
+      res.json({ ok: true, partidas });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  function esAdmin(req) {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) return true;
+    return req.get('x-admin-token') === adminToken;
+  }
+
+  /*
+   * --- Claves personales (PIN) ---
+   *
+   * Cada jugador demuestra quién es con una clave de 4 a 6 dígitos. Se guarda
+   * hasheada (nunca en claro) y no se devuelve por la API. La primera vez que
+   * alguien entra con un nombre sin clave, la que escriba queda registrada;
+   * el administrador puede asignarla o borrarla desde el panel.
+   */
+  const PIN_PEPPER = process.env.PIN_PEPPER || 'aje-corespon-pin-v1';
+  const PIN_MAX_FALLOS = 5;
+  const PIN_VENTANA_MS = 10 * 60 * 1000;
+  const pinFallos = new Map();
+
+  /*
+   * Alta de claves: solo se pueden registrar claves nuevas mientras está
+   * abierta. Por defecto cerrada, para que nadie reclame el nombre de otro.
+   * El momento de cierre se guarda en la base de datos y sobrevive a los
+   * reinicios.
+   */
+  const ALTA_CLAVES_KEY = 'alta_claves_hasta';
+
+  async function altaClavesHasta() {
+    const valor = await store.getAjuste(ALTA_CLAVES_KEY);
+    const hasta = valor ? Date.parse(valor) : NaN;
+    return Number.isFinite(hasta) ? hasta : null;
+  }
+
+  async function altaClavesAbierta(now = Date.now()) {
+    const hasta = await altaClavesHasta();
+    return hasta !== null && hasta > now;
+  }
+
+  async function abrirAltaClaves(horas) {
+    const horasNum = Number.isFinite(horas) && horas > 0 ? horas : 0;
+    const hasta = Date.now() + horasNum * 60 * 60 * 1000;
+    const iso = new Date(hasta).toISOString();
+    await store.setAjuste(ALTA_CLAVES_KEY, iso);
+    return { hasta, iso };
+  }
+
+  async function cerrarAltaClaves() {
+    await store.setAjuste(ALTA_CLAVES_KEY, null);
+    return { hasta: null, iso: null };
+  }
+
+  function hashPin(nombre, pin) {
+    return crypto.createHash('sha256')
+      .update(String(nombre).trim().toLowerCase() + ':' + String(pin).trim() + ':' + PIN_PEPPER)
+      .digest('hex');
+  }
+
+  function pinValidoFormato(pin) {
+    return typeof pin === 'string' && /^[0-9]{4,6}$/.test(pin.trim());
+  }
+
+  function pinBloqueado(clave) {
+    const registro = pinFallos.get(clave);
+    if (!registro) return false;
+    if (Date.now() - registro.desde > PIN_VENTANA_MS) {
+      pinFallos.delete(clave);
+      return false;
+    }
+    return registro.fallos >= PIN_MAX_FALLOS;
+  }
+
+  function anotarFalloPin(clave) {
+    const registro = pinFallos.get(clave);
+    if (!registro || Date.now() - registro.desde > PIN_VENTANA_MS) {
+      pinFallos.set(clave, { fallos: 1, desde: Date.now() });
+      return;
+    }
+    registro.fallos += 1;
+  }
+
+  /*
+   * Comprueba la clave de un jugador del roster.
+   * Devuelve { ok: true, jugador, guardada } o { ok: false, error }.
+   * `guardada` es true cuando la clave acaba de registrarse (primera vez).
+   */
+  async function verificarPinJugador(nombre, pin) {
+    const jugadores = await store.getPlayers();
+    const jugador = jugadores.find(p => sameName(p.nombre, nombre));
+    if (!jugador) return { ok: false, error: 'not_your_game' };
+
+    const clave = String(jugador.id || jugador.nombre).toLowerCase();
+    if (pinBloqueado(clave)) return { ok: false, error: 'rate_limited' };
+
+    const limpio = typeof pin === 'string' ? pin.trim() : '';
+    if (!limpio) return { ok: false, error: 'pin_requerido' };
+    if (!pinValidoFormato(limpio)) {
+      anotarFalloPin(clave);
+      return { ok: false, error: 'pin_invalido' };
+    }
+
+    const hash = hashPin(jugador.nombre, limpio);
+
+    if (jugador.pinHash) {
+      if (jugador.pinHash !== hash) {
+        anotarFalloPin(clave);
+        return { ok: false, error: 'pin_incorrecto' };
+      }
+      pinFallos.delete(clave);
+      return { ok: true, jugador, guardada: false };
+    }
+
+    // El jugador todavía no tiene clave: solo se puede registrar mientras el
+    // administrador mantiene abierta el alta.
+    if (!(await altaClavesAbierta())) {
+      return { ok: false, error: 'alta_cerrada' };
+    }
+
+    const registrada = await store.claimPlayerPinHash(jugador.id, hash);
+    if (registrada === true) {
+      pinFallos.delete(clave);
+      return { ok: true, jugador, guardada: true };
+    }
+    if (registrada === null) return { ok: false, error: 'not_your_game' };
+
+    // Otro dispositivo se adelantó registrando la clave.
+    anotarFalloPin(clave);
+    return { ok: false, error: 'pin_incorrecto' };
+  }
+
+  /*
+   * Listado completo (activos e inactivos) para el panel de administración.
+   * Los inactivos conservan su historial, pero no cuentan para el torneo.
+   */
+  app.get('/api/tournament/players', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+
+      const jugadores = await store.getPlayers();
+      res.json({
+        ok: true,
+        jugadores: jugadores.map(p => ({
+          id: p.id,
+          nombre: p.nombre,
+          activa: !!p.activa,
+          admin: !!p.admin,
+          tieneClave: !!p.pinHash
+        }))
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Alta/baja de un jugador (PATCH { activa: true|false }) y gestión de su
+   * clave personal (PATCH { pin: "1234" } para asignarla, { pin: null } para
+   * borrarla).
+   *
+   * Dar de baja no borra nada: solo marca `activa = false`, así que el
+   * jugador sale del torneo pero conserva sus partidas y su historial.
+   * Se impide bajar de 2 jugadores activos.
+   */
+  app.patch('/api/tournament/players/:id', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+
+      const body = req.body || {};
+
+      const jugadores = await store.getPlayers();
+      const jugador = jugadores.find(p => p.id === req.params.id);
+      if (!jugador) {
+        return res.status(404).json({ ok: false, error: 'Jugador no encontrado' });
+      }
+
+      // Clave personal (PIN): el administrador la asigna o la borra. Nunca
+      // se devuelve: solo si el jugador tiene una puesta.
+      if (body.pin !== undefined) {
+        const texto = body.pin === null ? '' : String(body.pin).trim();
+        if (body.pin !== null && !pinValidoFormato(texto)) {
+          return res.status(400).json({
+            ok: false,
+            error: 'La clave debe tener de 4 a 6 dígitos'
+          });
+        }
+
+        const hash = body.pin === null ? null : hashPin(jugador.nombre, texto);
+        await store.setPlayerPinHash(jugador.id, hash);
+
+        return res.json({
+          ok: true,
+          jugador: {
+            id: jugador.id,
+            nombre: jugador.nombre,
+            activa: !!jugador.activa,
+            tieneClave: !!hash
+          }
+        });
+      }
+
+      if (typeof body.activa !== 'boolean') {
+        return res.status(400).json({ ok: false, error: 'Indica activa: true o false' });
+      }
+
+      if (!body.activa) {
+        const quedanActivos = jugadores.filter(p => p.activa && p.id !== jugador.id);
+        if (quedanActivos.length < 2) {
+          return res.status(400).json({
+            ok: false,
+            error: 'El torneo necesita al menos 2 jugadores activos'
+          });
+        }
+      }
+
+      await store.setPlayerActiva(jugador.id, body.activa);
+
+      const [todos, resultados] = await Promise.all([
+        store.getPlayers(),
+        store.getResultados()
+      ]);
+      const activos = todos.filter(p => p.activa);
+      const jugadas = Array.isArray(resultados) ? resultados.length : 0;
+
+      res.json({
+        ok: true,
+        jugador: {
+          id: jugador.id,
+          nombre: jugador.nombre,
+          activa: !!body.activa,
+          tieneClave: !!jugador.pinHash
+        },
+        torneo: resumenTorneo(activos, jugadas)
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Cierra las sesiones abiertas: cambia los tokens de asiento de todas las
+   * partidas en curso (o de una sola con { roomCode }).
+   *
+   * Se usa una vez al activar las claves personales: así ninguna sesión
+   * antigua —por ejemplo una abierta con el nombre de otro jugador— puede
+   * seguir moviendo. No se pierde nada: state, history, plazos y timing
+   * quedan exactamente igual y la partida continúa donde estaba.
+   */
+  app.post('/api/admin/rotate-seats', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+
+      const pedido = req.body && req.body.roomCode ? normalizeCode(req.body.roomCode) : null;
+      const abiertas = await store.getPartidasAbiertas();
+      const objetivo = pedido ? abiertas.filter(p => p.roomCode === pedido) : abiertas;
+
+      const rotadas = [];
+      for (const partida of objetivo) {
+        const room = rooms.getRoom(partida.roomCode);
+        if (!room) continue;
+
+        for (const color of ['white', 'black']) {
+          const player = room.players[color];
+          if (!player) continue;
+          if (player.token) tokenMap.delete(player.token);
+          player.token = crypto.randomUUID();
+          player.connected = false;
+          player.socketId = null;
+          tokenMap.set(player.token, room.code);
+        }
+
+        await persistRoom(room);
+        io.in(room.code).disconnectSockets(true);
+        io.to(room.code).emit('corespon:room:update', room.toPublic());
+        rotadas.push(room.code);
+      }
+
+      res.json({ ok: true, salas: rotadas.length, roomCodes: rotadas });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Crea las vueltas que falten de partidas ya terminadas.
+   *
+   * Solo actúa sobre parejas con exactamente una partida terminada, ninguna
+   * abierta y los dos jugadores activos: crea la sala de vuelta con los
+   * colores cambiados. Es idempotente: al repetirlo no duplica nada.
+   * Se usa en el arranque (autorreparación) y desde el panel de admin.
+   */
+  async function crearVueltasPendientes(host) {
+    const [resultados, abiertas, jugadores] = await Promise.all([
+      store.getResultados(),
+      store.getPartidasAbiertas(),
+      store.getPlayers()
+    ]);
+
+    // Las partidas del torneo de parejas no generan revancha 1v1: su
+    // desempate y sus rondas los crea el manager del torneo.
+    const amistosas = [];
+    for (const r of resultados) {
+      if (r.roomCode && await torneo.esSalaDeTorneo(r.roomCode)) continue;
+      amistosas.push(r);
+    }
+
+    const activos = new Map(jugadores.map(p => [p.nombre.toLowerCase(), !!p.activa]));
+    const sigueActivo = (nombre) => activos.get(String(nombre).toLowerCase()) !== false;
+
+    // Agrupar los resultados por pareja, sin importar el orden de colores.
+    const parejas = new Map();
+    for (const r of amistosas) {
+      const clave = [r.blancas.toLowerCase(), r.negras.toLowerCase()].sort().join('|');
+      if (!parejas.has(clave)) parejas.set(clave, []);
+      parejas.get(clave).push(r);
+    }
+
+    const creadas = [];
+
+    for (const lista of parejas.values()) {
+      // Las dos partidas ya jugadas: no falta nada.
+      if (lista.length !== 1) continue;
+
+      const terminada = lista[0];
+      const blancasIda = terminada.blancas;
+      const negrasIda = terminada.negras;
+      if (!sigueActivo(blancasIda) || !sigueActivo(negrasIda)) continue;
+
+      // Si ya hay una sala abierta de la pareja, la vuelta está en marcha.
+      const hayAbierta = abiertas.some(p =>
+        (sameName(p.blancas, blancasIda) && sameName(p.negras, negrasIda))
+        || (sameName(p.blancas, negrasIda) && sameName(p.negras, blancasIda)));
+      if (hayAbierta) continue;
+
+      // Vuelta: los mismos jugadores con los colores cambiados.
+      const room = rooms.createRoom(negrasIda, blancasIda);
+      await persistRoom(room);
+
+      for (const color of ['white', 'black']) {
+        gateway.enqueue(room.code, VUELTA, room.players[color],
+          vueltaMsg(room, color, host), host);
+      }
+
+      creadas.push({
+        code: room.code,
+        blancas: room.players.white.name,
+        negras: room.players.black.name
+      });
+    }
+
+    return creadas;
+  }
+
+  /*
+   * Crea la primera partida de las parejas de jugadores activos que todavía
+   * no tienen ninguna (ni terminada ni abierta). La vuelta se crea sola al
+   * terminar la ida, así que aquí solo hace falta una por pareja.
+   *
+   * Los jugadores de baja se saltan (p. ej. Álvaro): no se les crea nada.
+   * No manda invitaciones: la partida aparece directamente en su listado.
+   */
+  async function crearPrimerasPendientes() {
+    const [resultados, abiertas, jugadores] = await Promise.all([
+      store.getResultados(),
+      store.getPartidasAbiertas(),
+      store.getPlayers()
+    ]);
+
+    const activos = jugadores
+      .filter(p => p.activa)
+      .map(p => p.nombre);
+    const clave = (a, b) => [String(a).toLowerCase(), String(b).toLowerCase()]
+      .sort().join('|');
+
+    // Parejas que ya tienen algo: ida terminada, vuelta o partida en curso.
+    const conHistoria = new Set();
+    for (const r of resultados) conHistoria.add(clave(r.blancas, r.negras));
+    for (const p of abiertas) conHistoria.add(clave(p.blancas, p.negras));
+
+    const creadas = [];
+    for (let i = 0; i < activos.length; i++) {
+      for (let j = i + 1; j < activos.length; j++) {
+        const a = activos[i];
+        const b = activos[j];
+        if (conHistoria.has(clave(a, b))) continue;
+
+        // Colores alternos: el reparto queda equilibrado y la vuelta los
+        // cambia de todas formas.
+        const blancas = (i + j) % 2 === 0 ? a : b;
+        const negras = blancas === a ? b : a;
+
+        const room = rooms.createRoom(blancas, negras);
+        await persistRoom(room);
+        creadas.push({ code: room.code, blancas, negras });
+      }
+    }
+
+    return creadas;
+  }
+
+  app.post('/api/admin/partidas-pendientes', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+      const vueltas = await crearVueltasPendientes(baseUrl(req));
+      const creadas = await crearPrimerasPendientes();
+      res.json({ ok: true, creadas, vueltas, total: creadas.length + vueltas.length });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  app.post('/api/admin/vueltas', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+      const creadas = await crearVueltasPendientes(baseUrl(req));
+      res.json({ ok: true, creadas, total: creadas.length });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Estado del alta de claves personales: si está abierta, hasta cuándo, y
+   * cuántos jugadores siguen sin clave.
+   */
+  app.get('/api/admin/enrollment', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+
+      const hasta = await altaClavesHasta();
+      const abierta = hasta !== null && hasta > Date.now();
+      const jugadores = await store.getPlayers();
+
+      res.json({
+        ok: true,
+        abierta,
+        hasta: abierta ? new Date(hasta).toISOString() : null,
+        jugadores: jugadores.length,
+        sinClave: jugadores.filter(p => !p.pinHash).length
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Abre o cierra el alta de claves. Body: { abrir: true, horas: 2 } para
+   * abrirla, o { abrir: false } para cerrarla de inmediato.
+   */
+  app.post('/api/admin/enrollment', async (req, res) => {
+    try {
+      if (!esAdmin(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
+
+      const body = req.body || {};
+
+      if (body.abrir === false) {
+        await cerrarAltaClaves();
+      } else {
+        const horas = Number(body.horas);
+        if (!Number.isFinite(horas) || horas <= 0 || horas > 168) {
+          return res.status(400).json({ ok: false, error: 'Indica horas entre 1 y 168' });
+        }
+        await abrirAltaClaves(horas);
+      }
+
+      const hasta = await altaClavesHasta();
+      const abierta = hasta !== null && hasta > Date.now();
+      const jugadores = await store.getPlayers();
+
+      res.json({
+        ok: true,
+        abierta,
+        hasta: abierta ? new Date(hasta).toISOString() : null,
+        jugadores: jugadores.length,
+        sinClave: jugadores.filter(p => !p.pinHash).length
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  /*
+   * Alta de un jugador antes de empezar el torneo.
+   *
+   * Es opcional y aditivo: el roster de 6 jugadores ya se crea al arrancar,
+   * de modo que en Render todo funciona sin llamar a este endpoint. Sirve
+   * para añadir un jugador extra; el torneo se recalcula solo.
+   *
+   * Body: { nombre: "Nombre", admin: false }
+   * Si ADMIN_TOKEN está definido, exige la cabecera x-admin-token.
+   */
+  app.post('/api/tournament/players', async (req, res) => {
+    try {
+      if (!esAdmin(req)) {
+        return res.status(401).json({ ok: false, error: 'No autorizado' });
+      }
+
+      const body = req.body || {};
+      const nombre = typeof body.nombre === 'string' ? body.nombre.trim() : '';
+      if (!nombre) {
+        return res.status(400).json({ ok: false, error: 'Se requiere un nombre de jugador' });
+      }
+      if (nombre.length > 40) {
+        return res.status(400).json({ ok: false, error: 'Nombre demasiado largo (máximo 40)' });
+      }
+
+      const id = nombre.toLowerCase().replace(/\s+/g, '-');
+      const jugadores = await store.getPlayers();
+      if (jugadores.some(p => p.id === id)) {
+        return res.status(409).json({ ok: false, error: 'Ya existe un jugador con ese nombre' });
+      }
+
+      const marcarAdmin = body.admin === true || body.admin === 'true';
+      await store.savePlayer({ id, nombre, activa: true, admin: marcarAdmin, telegram: null });
+
+      const activos = (await store.getPlayers()).filter(p => p.activa);
+      res.status(201).json({
+        ok: true,
+        mensaje: 'Jugador añadido al torneo',
+        jugador: { id, nombre, admin: marcarAdmin },
+        torneo: resumenTorneo(activos, 0)
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+
+  function randomToken() {
+    return crypto.randomUUID();
+  }
+
+  function bothConnected(room) {
+    return !!(room.players.white && room.players.black
+      && room.players.white.connected && room.players.black.connected);
+  }
+
+  /*
+   * Contexto de juego del socket.
+   *
+   * Devuelve null si el socket no ocupa un asiento en esa sala: espectadores,
+   * salas inexistentes o asientos reemplazados por otro socket. El color
+   * siempre sale de aquí, nunca del payload del cliente.
+   */
+  function socketContext(socket, expectedRoom) {
+    const ctx = socket.data && socket.data.corespon;
+    if (!ctx || !ctx.code) return null;
+    const room = rooms.getRoom(ctx.code);
+    if (!room) return null;
+    if (expectedRoom && room !== expectedRoom) return null;
+    const player = room.players[ctx.color];
+    if (!player) return null;
+    if (player.socketId && player.socketId !== socket.id) return null;
+    return { room, color: ctx.color, player };
+  }
+
+  function estadoAFen(state) {
+    const pieceToFen = {
+      '♙': 'P', '♖': 'R', '♘': 'N', '♗': 'B', '♕': 'Q', '♔': 'K',
+      '♟': 'p', '♜': 'r', '♞': 'n', '♝': 'b', '♛': 'q', '♚': 'k'
+    };
+    let fen = '';
+    for (let r = 0; r < 8; r++) {
+      let empty = 0;
+      for (let c = 0; c < 8; c++) {
+        const p = state.board[r][c];
+        if (p === ' ') {
+          empty++;
+        } else {
+          if (empty > 0) { fen += empty; empty = 0; }
+          fen += pieceToFen[p] || '?';
+        }
+      }
+      if (empty > 0) fen += empty;
+      if (r < 7) fen += '/';
+    }
+    fen += ' ' + (state.turn === 'white' ? 'w' : 'b');
+    let castling = '';
+    if (!state.kingMoved.white) {
+      if (!state.rookMoved.white.kingside) castling += 'K';
+      if (!state.rookMoved.white.queenside) castling += 'Q';
+    }
+    if (!state.kingMoved.black) {
+      if (!state.rookMoved.black.kingside) castling += 'k';
+      if (!state.rookMoved.black.queenside) castling += 'q';
+    }
+    fen += ' ' + (castling || '-');
+    if (state.epTarget) {
+      fen += ' ' + engine.squareName(state.epTarget.row, state.epTarget.col);
+    } else {
+      fen += ' -';
+    }
+    fen += ' ' + state.halfmove + ' ' + state.fullmove;
+    return fen;
+  }
+
+  function estadoAPgn(room) {
+    return buildPgn(room);
+  }
+
+  /*
+   * Avisa a cada asiento del color que le toca tras el intercambio y publica
+   * la sala nueva. Los sockets siguen siendo los mismos: solo cambia su
+   * contexto en el servidor, así que el jugador conserva la sesión.
+   */
+  function emitirVuelta(room) {
+    for (const color of ['white', 'black']) {
+      const player = room.players[color];
+      if (!player || !player.socketId) continue;
+      const target = io.sockets.sockets.get(player.socketId);
+      if (!target) continue;
+      target.data.corespon = { code: room.code, color };
+      target.emit('corespon:color', { code: room.code, color });
+    }
+    io.to(room.code).emit('corespon:room:update', room.toPublic());
+  }
+
+  /*
+   * Vuelta del torneo, automática.
+   *
+   * Cada pareja juega dos partidas. Al terminar la primera, la misma sala
+   * arranca de nuevo con los colores cambiados: nadie tiene que aceptar una
+   * revancha. La segunda partida no genera una tercera.
+   *
+   * Solo se crea si la pareja tiene exactamente una partida terminada y
+   * ninguna abierta, y si los dos jugadores siguen activos en el torneo.
+   */
+  async function crearVuelta(room, host) {
+    if (!room || !room.status.over || room.vueltaCreada) return false;
+    if (!room.players.white || !room.players.black) return false;
+
+    // Las partidas del torneo de parejas las gestiona su propio manager:
+    // no se crea la revancha automática del modo 1v1.
+    if (await torneo.esSalaDeTorneo(room.code)) return false;
+
+    const blancas = room.players.white.name;
+    const negras = room.players.black.name;
+    if (!blancas || !negras) return false;
+
+    // Reservado antes de la primera espera: si dos finales coinciden
+    // (rendición y plazo, por ejemplo) solo uno crea la vuelta.
+    room.vueltaCreada = true;
+
+    try {
+      const [resultados, abiertas, jugadores] = await Promise.all([
+        store.getResultados(),
+        store.getPartidasAbiertas(),
+        store.getPlayers()
+      ]);
+
+      const activos = new Map(jugadores.map(p => [p.nombre.toLowerCase(), !!p.activa]));
+      const sigueActivo = (nombre) => activos.get(String(nombre).toLowerCase()) !== false;
+      if (!sigueActivo(blancas) || !sigueActivo(negras)) return false;
+
+      const esPareja = (a, b) => (sameName(a, blancas) && sameName(b, negras))
+        || (sameName(a, negras) && sameName(b, blancas));
+
+      // Dos partidas por pareja: la vuelta solo se crea tras la primera.
+      const jugadas = resultados.filter(r => esPareja(r.blancas, r.negras)).length;
+      if (jugadas !== 1) return false;
+
+      // Si ya hay otra sala abierta de la pareja, su vuelta está en marcha.
+      const hayOtra = abiertas.some(p => p.roomCode !== room.code
+        && esPareja(p.blancas, p.negras));
+      if (hayOtra) return false;
+
+      const iniciada = room.iniciarVuelta();
+      if (!iniciada.ok) return false;
+
+      await persistRoom(room);
+      emitirVuelta(room);
+
+      for (const color of ['white', 'black']) {
+        gateway.enqueue(room.code, VUELTA, room.players[color],
+          vueltaMsg(room, color, host), host);
+      }
+      return true;
+    } catch (error) {
+      room.vueltaCreada = false;
+      if (!quiet) {
+        console.error('[corespon] No se pudo crear la vuelta', room.code + ':', error.message);
+      }
+      return false;
+    }
+  }
+
+  /*
+   * Aviso de fin para los dos asientos, con el rating ya actualizado.
+   * Debe llamarse después de persistRoom(): ahí se guarda el resultado.
+   */
+  async function notificarFin(room, host) {
+    let ratings = '';
+    try {
+      const [resultados, jugadores] = await Promise.all([
+        store.getResultados(),
+        store.getPlayers()
+      ]);
+      const tabla = computeClassification(resultados, jugadores);
+      const porNombre = new Map(tabla.map(fila => [fila.nombre, fila.rating]));
+
+      const blancas = room.players.white && room.players.white.name;
+      const negras = room.players.black && room.players.black.name;
+      if (blancas && negras) {
+        const ratingBlancas = porNombre.has(blancas)
+          ? porNombre.get(blancas) : RATING_INICIAL;
+        const ratingNegras = porNombre.has(negras)
+          ? porNombre.get(negras) : RATING_INICIAL;
+        ratings = `${blancas} ${ratingBlancas} · ${negras} ${ratingNegras}`;
+      }
+    } catch (error) {
+      if (!quiet) console.error('[corespon] No se pudo calcular el rating:', error.message);
+    }
+
+    const mensaje = finMsg(room, host, { ratings });
+    gateway.enqueue(room.code, FIN, room.players.white, mensaje, host);
+    gateway.enqueue(room.code, FIN, room.players.black, mensaje, host);
+
+    // La vuelta del torneo se crea sola: nadie tiene que aceptar nada.
+    // En el torneo de parejas, el manager decide si toca desempate o ronda
+    // nueva; solo el modo 1v1 crea la revancha automática.
+    try {
+      const gestion = await torneo.alTerminar(room);
+      if (!gestion.gestionada) await crearVuelta(room, host);
+    } catch (error) {
+      if (!quiet) console.error('[corespon] Error registrando el final del torneo:', error.message);
+    }
+  }
+
+  /*
+   * Guarda el resultado definitivo de la partida, una sola vez.
+   * Cada partida (ida y vuelta) produce su propia fila.
+   */
+  async function registrarResultado(room) {
+    if (!room.status.over || room.resultadoGuardado) return null;
+    room.resultadoGuardado = true;
+
+    const registro = {
+      blancas: room.players.white.name,
+      negras: room.players.black.name,
+      resultado: room.status.winner === 'white' ? 'blancas'
+        : room.status.winner === 'black' ? 'negras'
+        : 'tablas',
+      pgn: room.history.length ? estadoAPgn(room) : null,
+      duracionMs: Math.max(0, Date.now() - room.plazos.creadoEn),
+      movimientos: room.history.length,
+      prorrogas: room.plazos.prorrogas.length,
+      terminoPor: room.status.reason === 'resignation' ? 'renuncia'
+        : room.status.reason === 'time' ? 'tiempo'
+        : room.status.reason === 'agreement' ? 'acuerdo'
+        : 'jugada',
+      terminadoEn: new Date().toISOString(),
+      parentRoom: room.parentCode || null,
+      roomCode: room.code
+    };
+
+    try {
+      await store.saveResultado(registro);
+      return registro;
+    } catch (error) {
+      // Permitir reintento en la siguiente escritura de la sala.
+      room.resultadoGuardado = false;
+      if (!quiet) console.error('[corespon] Error guardando el resultado', room.code + ':', error.message);
+      return null;
+    }
+  }
+
+  /*
+   * Jugador que pasa libre cuando el número es impar: el mejor clasificado.
+   * computeClassification ya ordena por rating, victorias y nombre, así que
+   * ante un empate inicial (todos 1500) decide el orden alfabético.
+   */
+  async function elegirByeMejorClasificado(nombres) {
+    try {
+      const [resultados, jugadores] = await Promise.all([
+        store.getResultados(),
+        store.getPlayers()
+      ]);
+      const tabla = computeClassification(resultados, jugadores);
+      const enJuego = new Set((nombres || []).map((n) => n.toLowerCase()));
+      for (const fila of tabla) {
+        if (enJuego.has(fila.nombre.toLowerCase())) return fila.nombre;
+      }
+    } catch (error) {
+      if (!quiet) console.error('[corespon] No se pudo elegir el bye:', error.message);
+    }
+    return (nombres && nombres[0]) || null;
+  }
+
+  /*
+   * Crea la sala real de una partida del torneo de parejas y avisa a los dos
+   * jugadores por Telegram. La usa el manager del torneo.
+   */
+  async function crearSalaTorneo({ blanco, negro, ronda }) {
+    const room = rooms.createRoom(blanco, negro);
+    await persistRoom(room);
+
+    const host = baseUrl();
+    for (const color of ['white', 'black']) {
+      gateway.enqueue(room.code, PAREJAS, room.players[color],
+        parejasMsg(room, color, host, { ronda }), host);
+    }
+    return { code: room.code, room };
+  }
+
+  async function persistRoom(room) {
+    const pgn = room.history.length ? estadoAPgn(room) : null;
+
+    try {
+      await store.savePartida({
+        roomCode: room.code,
+        blancas: room.players.white.name,
+        negras: room.players.black.name,
+        fen: estadoAFen(room.state),
+        pgn,
+        snapshot: room.snapshot(),
+        turno: room.turnColor(),
+        estado: room.status.over ? 'terminada' : 'abierta',
+        resultado: room.status.over
+          ? (room.status.winner === 'white' ? 'blancas'
+            : room.status.winner === 'black' ? 'negras'
+            : 'tablas')
+          : null,
+        creadoEn: room.plazos.creadoEn,
+        movidaEn: new Date().toISOString(),
+        plazoHasta: new Date(room.plazos.plazoHasta).toISOString(),
+        graciaHasta: new Date(room.plazos.graciaHasta).toISOString(),
+        prorrogas: room.plazos.prorrogas,
+        ultimaProrrogaHasta: room.plazos.ultimaProrrogaHasta
+          ? new Date(room.plazos.ultimaProrrogaHasta).toISOString() : null
+      });
+    } catch (error) {
+      // Persistir nunca debe tumbar el proceso: la partida sigue en memoria.
+      if (!quiet) console.error('[corespon] Error guardando la partida', room.code + ':', error.message);
+      return null;
+    }
+
+    if (room.status.over) await registrarResultado(room);
+    return true;
+  }
+
+  /*
+   * Recarga las partidas abiertas guardadas en la base de datos.
+   * Se ejecuta una vez, antes de abrir el puerto.
+   */
+  async function restoreRooms() {
+    try {
+      const abiertas = await store.getPartidasAbiertas();
+      const restored = rooms.hydrateAll(abiertas);
+      const skipped = abiertas.length - restored.length;
+      if (restored.length) log('Partidas restauradas:', restored.length);
+      if (skipped > 0) log('Partidas sin snapshot, no restauradas:', skipped);
+
+      // Autorreparación: si una partida terminó sin que se creara su vuelta
+      // (por ejemplo, antes de este cambio o por un reinicio a medias), se
+      // crea ahora. Es idempotente y respeta a los jugadores de baja.
+      await rosterListo.catch(() => {});
+      const creadas = await crearVueltasPendientes(baseUrl());
+      if (creadas.length) {
+        log('Vueltas creadas al arrancar:', creadas.map(p => p.code).join(', '));
+      }
+
+      // Completar el torneo: parejas de jugadores activos que aún no tienen
+      // ninguna partida. Se salta a los jugadores de baja (Álvaro).
+      if (options.completarAlArrancar) {
+        const nuevas = await crearPrimerasPendientes();
+        if (nuevas.length) {
+          log('Partidas nuevas al arrancar:', nuevas
+            .map(p => p.blancas + '-' + p.negras + ' (' + p.code + ')')
+            .join(', '));
+        }
+      }
+
+      return restored;
+    } catch (error) {
+      if (!quiet) console.error('[corespon] Error restaurando partidas:', error.message);
+      return [];
+    }
+  }
+
+  let readyPromise = null;
+  function ready() {
+    if (!readyPromise) readyPromise = restoreRooms();
+    return readyPromise;
+  }
+
+  /*
+   * Arranca el servidor HTTP. No se llama automáticamente: los tests usan
+   * `server.listen(0)` sobre la instancia devuelta.
+   */
+  function start(port) {
+    // `start(0)` debe pedir un puerto efímero (los tests lo usan para poder
+    // correr en paralelo); solo se cae al puerto por defecto si no hay valor.
+    const pedido = port !== undefined && port !== null && port !== ''
+      ? Number(port)
+      : Number(options.port) || Number(process.env.PORT) || 3001;
+    const chosen = Number.isFinite(pedido) ? pedido : 3001;
+    return ready().then(() => new Promise((resolve, reject) => {
+      const onError = (error) => {
+        server.off('listening', onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        const actual = server.address() && typeof server.address() === 'object'
+          ? server.address().port
+          : chosen;
+        currentPort = actual;
+        log('Servidor de correspondencia en puerto ' + actual);
+        log('Abre http://localhost:' + actual + '/corespon');
+        resolve(actual);
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(chosen);
+    }));
+  }
+
+  /*
+   * Libera temporizadores, conexiones y el pool de base de datos.
+   * Imprescindible para que los tests de integración terminen.
+   */
+  async function close() {
+    for (const timer of timers) clearInterval(timer);
+    timers.length = 0;
+
+    // Corta las conexiones de socket.io y el servidor HTTP (si sigue abierto).
+    await new Promise((resolve) => io.close(() => resolve()));
+    await new Promise((resolve) => {
+      if (!server.listening) return resolve();
+      server.close(() => resolve());
+    });
+
+    await store.close().catch(() => {});
+  }
+
+  return { app, server, io, rooms, store, gateway, start, close, ready };
+}
+
+module.exports = { createServer, Room };
+
+if (require.main === module) {
+  const instance = createServer({ quiet: false });
+  instance.start().catch((error) => {
+    console.error('[corespon] No se pudo arrancar el servidor:', error.message);
+    process.exit(1);
+  });
+}

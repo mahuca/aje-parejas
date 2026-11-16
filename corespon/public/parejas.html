@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aje-Parejas · Torneo knockout</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {
+      --fondo: #10151f;
+      --panel: #18202e;
+      --panel-2: #1f2a3b;
+      --borde: #2c3a50;
+      --texto: #e8eef8;
+      --suave: #94a3b8;
+      --ambar: #f2b544;
+      --verde: #43c59e;
+      --rojo: #ef6461;
+      --azul: #5aa9e6;
+      --radio: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 600px at 50% -200px, #1b2940 0%, var(--fondo) 60%);
+      color: var(--texto);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+    }
+    header {
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+      justify-content: space-between;
+      padding: 22px clamp(16px, 4vw, 48px);
+      border-bottom: 1px solid var(--borde);
+      background: rgba(16, 21, 31, .7);
+      backdrop-filter: blur(8px);
+    }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
+    header h1 span { color: var(--ambar); }
+    .enlace-tablero {
+      color: var(--texto); text-decoration: none; font-weight: 600;
+      padding: 10px 16px; border: 1px solid var(--borde); border-radius: 999px;
+      background: var(--panel-2);
+    }
+    .enlace-tablero:hover { border-color: var(--ambar); }
+
+    main {
+      max-width: 1080px; margin: 0 auto;
+      padding: clamp(16px, 3vw, 36px) clamp(12px, 4vw, 32px) 80px;
+      display: grid; gap: 22px;
+    }
+    section {
+      background: var(--panel); border: 1px solid var(--borde);
+      border-radius: var(--radio); padding: clamp(16px, 3vw, 24px);
+    }
+    h2 { margin: 0 0 6px; font-size: 18px; }
+    p.ayuda, .suave { color: var(--suave); font-size: 14px; }
+    label { display: block; font-size: 13px; color: var(--suave); margin: 12px 0 6px; }
+    input, textarea, button { font: inherit; }
+    input[type="text"], input[type="password"], textarea {
+      width: 100%; padding: 11px 13px; border-radius: 10px;
+      border: 1px solid var(--borde); background: #0f1621; color: var(--texto);
+    }
+    input:focus, textarea:focus { outline: 2px solid rgba(242,181,68,.45); border-color: var(--ambar); }
+    textarea { min-height: 96px; resize: vertical; }
+    .fila { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    .fila > div { flex: 1 1 220px; }
+    button.principal {
+      background: linear-gradient(180deg, #f6c25a, #e0a52d);
+      color: #201603; border: 0; border-radius: 10px;
+      padding: 12px 20px; font-weight: 700; cursor: pointer;
+    }
+    button.principal:hover { filter: brightness(1.06); }
+    button.principal:disabled { opacity: .55; cursor: wait; }
+    .aviso { margin-top: 12px; padding: 10px 13px; border-radius: 10px; font-size: 14px; display: none; }
+    .aviso.ok { display: block; background: rgba(67,197,158,.12); border: 1px solid rgba(67,197,158,.4); }
+    .aviso.error { display: block; background: rgba(239,100,97,.12); border: 1px solid rgba(239,100,97,.4); }
+
+    .cabecera-torneo { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      border-radius: 999px; padding: 5px 12px; font-size: 13px; font-weight: 600;
+      border: 1px solid var(--borde); background: var(--panel-2); color: var(--suave);
+    }
+    .chip.activo { color: var(--verde); border-color: rgba(67,197,158,.5); }
+    .chip.final { color: var(--ambar); border-color: rgba(242,181,68,.5); }
+    .campeon {
+      margin-top: 14px; padding: 18px; border-radius: 12px; text-align: center;
+      background: linear-gradient(135deg, rgba(242,181,68,.2), rgba(242,181,68,.05));
+      border: 1px solid rgba(242,181,68,.55);
+    }
+    .campeon strong { display: block; font-size: 24px; color: var(--ambar); margin-top: 4px; }
+
+    .ronda { margin-top: 18px; }
+    .ronda h3 { margin: 0 0 10px; font-size: 15px; color: var(--suave); text-transform: uppercase; letter-spacing: .8px; }
+    .partidas { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .partida {
+      border: 1px solid var(--borde); border-radius: 12px; overflow: hidden;
+      background: var(--panel-2);
+    }
+    .partida .jugador {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 9px 13px; font-size: 15px;
+    }
+    .partida .jugador + .jugador { border-top: 1px solid var(--borde); }
+    .partida .jugador.ganador { color: var(--verde); font-weight: 700; }
+    .partida .color { font-size: 12px; color: var(--suave); }
+    .partida .pie {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+      padding: 8px 13px 11px; border-top: 1px dashed var(--borde); font-size: 13px;
+    }
+    .partida .pie a { color: var(--azul); font-weight: 600; text-decoration: none; }
+    .partida .pie a:hover { text-decoration: underline; }
+    .estado-p { color: var(--suave); }
+    .estado-p.tablas { color: var(--ambar); }
+    .estado-p.ganada { color: var(--verde); }
+    .bye { color: var(--suave); font-style: italic; margin-top: 8px; }
+
+    .lista-jugador { margin-top: 12px; display: grid; gap: 8px; }
+    .lista-jugador .fila-juego {
+      display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between;
+      border: 1px solid var(--borde); border-radius: 10px; padding: 10px 13px;
+      background: var(--panel-2); font-size: 14px;
+    }
+    .lista-jugador a { color: var(--azul); font-weight: 600; text-decoration: none; }
+    .vacío { color: var(--suave); font-size: 14px; margin-top: 10px; }
+
+    .roster { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+    .roster .jugador-chip {
+      display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+      border: 1px solid var(--borde); border-radius: 999px;
+      padding: 7px 13px; background: var(--panel-2); font-size: 14px;
+      user-select: none;
+    }
+    .roster .jugador-chip:has(input:checked) {
+      border-color: var(--ambar); background: rgba(242,181,68,.12);
+    }
+    .roster input { accent-color: var(--ambar); }
+    button.secundario {
+      background: var(--panel-2); color: var(--texto);
+      border: 1px solid var(--borde); border-radius: 999px;
+      padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    button.secundario:hover { border-color: var(--ambar); }
+
+    .sorteo-titulo { margin: 14px 0 0; font-weight: 700; }
+    .sorteo-lista { margin-top: 10px; display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .sorteo-lista .emparejamiento {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+      border: 1px solid var(--borde); border-radius: 10px;
+      padding: 10px 13px; background: var(--panel-2); font-size: 14px;
+    }
+    .sorteo-lista .vs { color: var(--ambar); font-weight: 700; }
+    footer { text-align: center; color: var(--suave); font-size: 12px; padding-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>♟ Aje-<span>Parejas</span></h1>
+    <a class="enlace-tablero" href="/corespon">Ir al tablero</a>
+  </header>
+
+  <main>
+    <section>
+      <div class="cabecera-torneo">
+        <div>
+          <h2>Torneo knockout de parejas</h2>
+          <p class="ayuda">Sorteo aleatorio de parejas y colores. Gana quien vence la partida; si hay tablas se repite con los colores cambiados. Los ganadores se vuelven a emparejar al azar hasta que quede el campeón.</p>
+        </div>
+        <span id="estadoTorneo" class="chip">Sin torneo</span>
+      </div>
+      <div id="campeon"></div>
+      <div id="sorteo"></div>
+    </section>
+
+    <section>
+      <h2>Crear torneo y sortear parejas</h2>
+      <p class="ayuda">Marca los jugadores que participan. El botón hace el sorteo aleatorio de parejas y colores y crea las salas de la primera ronda. Si el número es impar, pasa libre el jugador <strong>mejor clasificado</strong> (desempate: victorias y orden alfabético).</p>
+
+      <label for="nombreTorneo">Nombre del torneo (opcional)</label>
+      <input id="nombreTorneo" type="text" maxlength="60" placeholder="Torneo de parejas">
+
+      <label>Jugadores disponibles en la app</label>
+      <div id="rosterJugadores" class="roster"></div>
+      <div class="fila" style="margin-top:10px">
+        <button id="todosBtn" class="secundario" type="button">Todos</button>
+        <button id="ningunoBtn" class="secundario" type="button">Ninguno</button>
+      </div>
+
+      <label for="nombres" style="margin-top:18px">Jugadores del sorteo (uno por línea)</label>
+      <textarea id="nombres" placeholder="Manuel&#10;Fernan&#10;Alberto&#10;Abuelo"></textarea>
+      <label for="adminToken">Token de administración (si el servidor lo exige)</label>
+      <input id="adminToken" type="password" autocomplete="off" placeholder="ADMIN_TOKEN">
+      <div class="fila" style="margin-top:14px">
+        <div style="flex:0 0 auto">
+          <button id="crearBtn" class="principal" type="button">Sortear parejas y empezar</button>
+        </div>
+      </div>
+      <div id="aviso" class="aviso"></div>
+    </section>
+
+    <section id="cuadroSeccion">
+      <h2>Cuadro del torneo</h2>
+      <div id="cuadro"><p class="vacío">Todavía no hay ningún torneo. Crea uno para empezar.</p></div>
+    </section>
+
+    <section>
+      <h2>Mis partidas</h2>
+      <p class="ayuda">Escribe tu nombre para ver las partidas que te tocan.</p>
+      <div class="fila">
+        <div><input id="buscarNombre" type="text" placeholder="Tu nombre"></div>
+        <div style="flex:0 0 auto"><button id="buscarBtn" class="principal" type="button">Buscar</button></div>
+      </div>
+      <div id="misPartidas" class="lista-jugador"></div>
+    </section>
+  </main>
+
+  <footer>Aje-Parejas · ajedrez por correspondencia</footer>
+  <script src="/parejas.js"></script>
+</body>
+</html>
