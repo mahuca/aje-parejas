@@ -1793,7 +1793,7 @@ test('api: /healthz responde sin tocar la base de datos', async (t) => {
 
   const data = await res.json();
   assert.equal(data.ok, true);
-  assert.equal(data.servicio, 'aje-corespon');
+  assert.equal(data.servicio, 'aje-parejas');
   assert.equal(data.storage, 'memory');
   assert.ok(data.uptime >= 0);
 });

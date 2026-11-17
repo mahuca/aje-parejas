@@ -779,7 +779,7 @@ function createServer(options = {}) {
   app.get('/healthz', (req, res) => {
     res.json({
       ok: true,
-      servicio: 'aje-corespon',
+      servicio: 'aje-parejas',
       uptime: Math.round(process.uptime()),
       storage: store.kind || 'memory'
     });
@@ -969,7 +969,7 @@ function createServer(options = {}) {
    * alguien entra con un nombre sin clave, la que escriba queda registrada;
    * el administrador puede asignarla o borrarla desde el panel.
    */
-  const PIN_PEPPER = process.env.PIN_PEPPER || 'aje-corespon-pin-v1';
+  const PIN_PEPPER = process.env.PIN_PEPPER || 'aje-parejas-pin-v1';
   const PIN_MAX_FALLOS = 5;
   const PIN_VENTANA_MS = 10 * 60 * 1000;
   const pinFallos = new Map();
