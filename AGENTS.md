@@ -21,6 +21,8 @@
 
 ## 2. Arquitectura y entrypoints
 
+- **Checklist de arranque del torneo:** `CHECKLIST-INICIO.md` (crear torneo, repartir claves, cerrar el alta, tablas y desempate en vivo).
+
 - **Servidor:** `server.js` — entrada Node/Express + Socket.IO. Escucha en `PORT=3001`.
 - **Rutas principales:** `corespon/server/server.js` (HTTP + Socket.IO), `corespon/server/rooms.js` (reglas de sala), `corespon/server/db.js` (store), `corespon/server/classification.js` (ranking 1500±25), `corespon/server/telegram.js` (notificaciones Telegram).
 - **Cliente:** `corespon/public/` — HTML/JS del tablero (`corespon.html`, `online-core.js`, `corespon.js`).

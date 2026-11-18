@@ -5,6 +5,7 @@ Torneo de ajedrez por correspondencia en formato **knockout de parejas**.
 - **En línea:** https://aje-parejas.onrender.com/parejas
 - **Cuadro y sorteo:** `/parejas`
 - **Lobby y clasificación:** `/corespon`
+- **Día de inicio:** [CHECKLIST-INICIO.md](CHECKLIST-INICIO.md)
 
 ## Cómo funciona
 
