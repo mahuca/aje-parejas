@@ -325,3 +325,145 @@ test('flujo real: tablas repiten la partida con los colores cambiados', async (t
   assert.equal(torneo.estado, 'en_curso');
   assert.equal(torneo.campeon, null);
 });
+
+function once(socket, event, timeout = 5000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeout);
+    socket.once(event, (payload) => {
+      clearTimeout(timer);
+      resolve(payload);
+    });
+  });
+}
+
+test('sala en vivo: no caduca y no ofrece prórroga', () => {
+  const { RoomManager } = require('../server/rooms');
+  const manager = new RoomManager();
+  const viva = manager.createRoom('Ana', 'Luis', { ritmo: 'vivo', desempate: true });
+
+  // Plazo vencido de sobra: una sala normal perdería; la viva no.
+  viva.plazos.plazoHasta = Date.now() - 60000;
+  viva.plazos.graciaHasta = Date.now() - 30000;
+
+  assert.equal(manager.checkDeadlines().length, 0);
+  assert.equal(viva.status.over, false);
+  assert.equal(viva.canExtend(), false);
+  assert.equal(viva.ritmo, 'vivo');
+  assert.equal(viva.desempate, true);
+
+  const normal = manager.createRoom('Ana', 'Luis');
+  normal.plazos.plazoHasta = Date.now() - 60000;
+  normal.plazos.graciaHasta = Date.now() - 30000;
+  assert.equal(manager.checkDeadlines().length, 1);
+});
+
+test('flujo real: tablas ofrecen desempate y el acuerdo lo pone en vivo', async (t) => {
+  const { instance, port, base } = await bootServer();
+  t.after(() => cerrar(instance));
+
+  const { datos } = await crearTorneoApi(base, ['Ana', 'Luis']);
+  const primera = datos.torneo.partidas[0];
+
+  const { socket: uno, joined: j1 } = await unirse(port, primera.roomCode, primera.blanco);
+  const { socket: dos, joined: j2 } = await unirse(port, primera.roomCode, primera.negro);
+  assert.equal(j1.ok, true);
+  assert.equal(j2.ok, true);
+  const blanco = j1.color === 'white' ? uno : dos;
+  const negro = j1.color === 'white' ? dos : uno;
+
+  // La partida que acaba en tablas avisa del desempate en su sala.
+  let siguiente = null;
+  blanco.on('corespon:room:update', (payload) => {
+    if (payload && payload.code === primera.roomCode && payload.siguienteSala) {
+      siguiente = payload.siguienteSala;
+    }
+  });
+
+  await request(blanco, 'corespon:draw', { code: primera.roomCode });
+  await request(negro, 'corespon:draw:accept', { code: primera.roomCode });
+
+  const codeDesempate = await esperar(() => siguiente);
+  assert.ok(codeDesempate, 'la partida anterior debe ofrecer la sala de desempate');
+  assert.notEqual(codeDesempate, primera.roomCode);
+
+  const torneo = await esperar(async () => {
+    const actual = await fetch(base + '/api/parejas/torneos/actual').then((r) => r.json());
+    return actual.torneo && actual.torneo.partidas.length === 2 ? actual.torneo : null;
+  });
+  const segunda = torneo.partidas.find((p) => p.juego === 2);
+  assert.equal(segunda.roomCode, codeDesempate);
+  assert.equal(segunda.desempate, true);
+  assert.equal(segunda.ritmo, 'correspondencia');
+
+  // Acepta uno: todavía no es en vivo.
+  const r1 = await request(blanco, 'corespon:vivo:aceptar', { code: codeDesempate });
+  assert.equal(r1.ok, true);
+  assert.equal(r1.listo, false);
+
+  const aviso = once(negro, 'corespon:vivo:listo');
+  const r2 = await request(negro, 'corespon:vivo:aceptar', { code: codeDesempate });
+  assert.equal(r2.ok, true);
+  assert.equal(r2.listo, true);
+  assert.equal(r2.vivoAceptado.white, true);
+  assert.equal(r2.vivoAceptado.black, true);
+
+  const listo = await aviso;
+  assert.ok(listo, 'los dos jugadores deben recibir el aviso de partida en vivo');
+  assert.equal(listo.code, codeDesempate);
+
+  // La sala y el cuadro reflejan el ritmo vivo.
+  const abiertas = await fetch(base + '/api/partidas').then((r) => r.json());
+  const viva = abiertas.partidas.find((p) => p.roomCode === codeDesempate);
+  assert.ok(viva);
+  assert.equal(viva.ritmo, 'vivo');
+
+  const cuadro = await fetch(base + '/api/parejas/torneos/actual').then((r) => r.json());
+  const enCuadro = cuadro.torneo.partidas.find((p) => p.roomCode === codeDesempate);
+  assert.equal(enCuadro.ritmo, 'vivo');
+
+  // Cualquiera con el enlace puede mirarla, pero no mover.
+  const espectador = await connect(port);
+  const visto = await request(espectador, 'corespon:watch', { code: codeDesempate });
+  assert.equal(visto.ok, true);
+  assert.equal(visto.room.ritmo, 'vivo');
+  assert.equal(visto.room.desempate, true);
+  const intento = await request(espectador, 'corespon:move', {
+    code: codeDesempate, from: { row: 6, col: 4 }, to: { row: 4, col: 4 }
+  });
+  assert.equal(intento.ok, false);
+  assert.equal(intento.error, 'not_in_room');
+});
+
+test('acuerdo: solo cuenta si aceptan los dos asientos', async (t) => {
+  const { instance, port, base } = await bootServer();
+  t.after(() => cerrar(instance));
+
+  const { datos } = await crearTorneoApi(base, ['Ana', 'Luis']);
+  const primera = datos.torneo.partidas[0];
+  const { socket: uno, joined: j1 } = await unirse(port, primera.roomCode, primera.blanco);
+  const { socket: dos } = await unirse(port, primera.roomCode, primera.negro);
+  const blanco = j1.color === 'white' ? uno : dos;
+
+  await request(blanco, 'corespon:draw', { code: primera.roomCode });
+  const otro = j1.color === 'white' ? dos : uno;
+  await request(otro, 'corespon:draw:accept', { code: primera.roomCode });
+
+  const torneo = await esperar(async () => {
+    const actual = await fetch(base + '/api/parejas/torneos/actual').then((r) => r.json());
+    return actual.torneo && actual.torneo.partidas.length === 2 ? actual.torneo : null;
+  });
+  const desempate = torneo.partidas.find((p) => p.juego === 2);
+
+  // Una sala que no es desempate no se puede poner en vivo.
+  const rechazo = await request(blanco, 'corespon:vivo:aceptar', { code: primera.roomCode });
+  assert.equal(rechazo.ok, false);
+  assert.ok(['not_tiebreak', 'game_over'].includes(rechazo.error));
+
+  const parcial = await request(blanco, 'corespon:vivo:aceptar', { code: desempate.roomCode });
+  assert.equal(parcial.ok, true);
+  assert.equal(parcial.listo, false);
+
+  const abiertas = await fetch(base + '/api/partidas').then((r) => r.json());
+  const sala = abiertas.partidas.find((p) => p.roomCode === desempate.roomCode);
+  assert.equal(sala.ritmo, 'correspondencia');
+});

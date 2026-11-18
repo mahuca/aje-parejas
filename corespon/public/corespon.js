@@ -46,6 +46,7 @@
     not_your_scheduled: 'No es tu turno en esa partida.',
     not_finished: 'La partida aún no ha terminado.',
     not_your_game: 'Esa partida no es tuya: comprueba el nombre elegido.',
+    not_tiebreak: 'Esa sala no es un desempate.',
     seat_taken: 'Ese asiento está ocupado ahora mismo en otro dispositivo. Espera unos segundos y vuelve a intentarlo.',
     pin_requerido: 'Escribe tu clave para entrar (4-6 dígitos).',
     pin_incorrecto: 'Clave incorrecta. Vuelve a intentarlo.',
@@ -92,6 +93,11 @@
     waitingCopyBtn: document.getElementById('waitingCopyBtn'),
     tournamentLink: document.getElementById('tournamentLink'),
     spectatorNote: document.getElementById('spectatorNote'),
+    vivoCard: document.getElementById('vivoCard'),
+    vivoIcon: document.getElementById('vivoIcon'),
+    vivoTitulo: document.getElementById('vivoTitulo'),
+    vivoTexto: document.getElementById('vivoTexto'),
+    vivoBtn: document.getElementById('vivoBtn'),
     topClock: document.getElementById('topClock'),
     bottomClock: document.getElementById('bottomClock'),
     timeSummary: document.getElementById('timeSummary'),
@@ -158,6 +164,8 @@
   let toastTimer = null;
   let isSpectator = false;
   let lastDrawOffer = null;
+  // Este jugador ya ha aceptado el desempate en vivo y espera al rival.
+  let vivoSolicitado = false;
   let clockSkew = 0;
   let clockTimer = null;
   // null = se está viendo la posición actual; un número = jugadas aplicadas
@@ -329,8 +337,10 @@
     el.promotionOverlay.hidden = true;
     vista = null;
     vueltaInfo = null;
+    vivoSolicitado = false;
     render();
     renderPlazoCard();
+    renderVivoCard();
   }
 
   // ==================== MIRAR JUGADAS ANTERIORES ====================
@@ -588,6 +598,11 @@
 
   function renderPlazoCard() {
     if (!room) return;
+    // En vivo no hay plazo: manda la tarjeta de partida en vivo.
+    if (room.ritmo === 'vivo') {
+      el.plazoCard.hidden = true;
+      return;
+    }
     const isYou = !isSpectator && room.state.turn === myColor;
     const over = room.status.over;
 
@@ -645,6 +660,65 @@
     const esTuTurno = !isSpectator && room.state.turn === myColor;
     const texto = esTuTurno ? plazo.textoConGracia : plazo.texto;
     el.plazoText.textContent = texto;
+  }
+
+  // ==================== EN VIVO / DESEMPATE ====================
+
+  /*
+   * Tarjeta de partida en vivo. También ofrece el acuerdo para jugar el
+   * desempate del tirón: en la sala del desempate y, desde la partida que
+   * acabó en tablas, con el enlace a la sala siguiente.
+   */
+  function renderVivoCard() {
+    if (!room) {
+      el.vivoCard.hidden = true;
+      return;
+    }
+
+    const enVivo = room.ritmo === 'vivo';
+    const pendiente = !enVivo && !isSpectator && !room.status.over
+      && !!room.desempate;
+    const ofreceSiguiente = !isSpectator && !!room.siguienteSala;
+
+    if (!enVivo && !pendiente && !ofreceSiguiente) {
+      el.vivoCard.hidden = true;
+      el.vivoBtn.hidden = true;
+      return;
+    }
+
+    el.vivoCard.hidden = false;
+    el.vivoCard.classList.toggle('is-live', enVivo && !ofreceSiguiente);
+
+    // Si el desempate anterior acabó en tablas, manda la oferta de jugar el
+    // siguiente del tirón (también si la sala era en vivo).
+    if (!ofreceSiguiente && enVivo) {
+      const mirando = Number(room.spectators) || 0;
+      el.vivoIcon.textContent = '🔴';
+      el.vivoTitulo.textContent = 'Partida en vivo';
+      el.vivoTexto.textContent = 'Sin límite de tiempo · '
+        + (mirando === 1 ? '1 espectador' : mirando + ' espectadores');
+      el.vivoBtn.hidden = true;
+      return;
+    }
+
+    const code = room.siguienteSala || room.code;
+    const aceptados = room.vivoAceptado || {};
+    const cuantos = (aceptados.white ? 1 : 0) + (aceptados.black ? 1 : 0);
+
+    el.vivoIcon.textContent = '⚡';
+    el.vivoTitulo.textContent = room.siguienteSala
+      ? 'Tablas · desempate'
+      : 'Desempate por acuerdo';
+    el.vivoTexto.textContent = cuantos && room.desempate
+      ? cuantos + ' de 2 han aceptado. Si aceptáis los dos, se juega ahora.'
+      : 'Si aceptáis los dos, el desempate se juega ahora en vivo, sin plazo.';
+
+    el.vivoBtn.hidden = false;
+    el.vivoBtn.dataset.code = code;
+    el.vivoBtn.disabled = vivoSolicitado;
+    el.vivoBtn.textContent = vivoSolicitado
+      ? 'Esperando al rival…'
+      : 'Jugar el desempate ahora';
   }
 
   // ==================== ESTADO ====================
@@ -875,7 +949,11 @@
       ? 'Jaque mate'
       : 'Fin de la partida';
     el.resultTitle.textContent = info.title;
-    el.resultText.textContent = info.text;
+    el.resultText.textContent = info.text
+      + (room.siguienteSala && !isSpectator
+        ? ' Si aceptáis los dos, podéis jugar el desempate ahora en vivo'
+          + ' con el botón de debajo del tablero.'
+        : '');
 
     // La vuelta se crea sola: no hay nada que aceptar. Cuando no hay vuelta
     // (era la segunda partida de la pareja) solo queda volver a la lista.
@@ -893,6 +971,7 @@
     renderClocks();
     renderOverlays();
     renderPlazoCard();
+    renderVivoCard();
   }
 
   // ==================== RESULTADO ====================
@@ -2008,11 +2087,20 @@
 
         const plazo = document.createElement('div');
         plazo.className = 'partida-plazo';
-        const plazoBadge = document.createElement('span');
-        plazoBadge.className = 'plazo-badge';
-        plazoBadge.title = 'Plazo hasta ' + formatFecha(p.plazoHasta);
-        plazoBadge.textContent = '⏰ ' + formatFecha(p.plazoHasta);
-        plazo.appendChild(plazoBadge);
+        if (p.ritmo === 'vivo') {
+          item.classList.add('en-vivo');
+          const vivoBadge = document.createElement('span');
+          vivoBadge.className = 'vivo-badge';
+          vivoBadge.title = 'Partida en vivo: sin plazo';
+          vivoBadge.textContent = '🔴 En vivo';
+          plazo.appendChild(vivoBadge);
+        } else {
+          const plazoBadge = document.createElement('span');
+          plazoBadge.className = 'plazo-badge';
+          plazoBadge.title = 'Plazo hasta ' + formatFecha(p.plazoHasta);
+          plazoBadge.textContent = '⏰ ' + formatFecha(p.plazoHasta);
+          plazo.appendChild(plazoBadge);
+        }
 
         const boton = document.createElement('button');
         boton.type = 'button';
@@ -2374,6 +2462,47 @@
     }
   }
 
+  /*
+   * Entrada automática al desempate en vivo (`?auto=1`): usa el nombre y la
+   * clave ya guardados en este dispositivo. Si falta algo, deja el lobby
+   * con el código puesto para que solo haya que confirmar.
+   */
+  async function autoJoinRoom(code) {
+    const name = O.getName() || nombreActual();
+    if (!name) {
+      showLobbyError('Elige tu nombre y escribe tu clave para entrar al desempate.');
+      return;
+    }
+    const pin = leerPin(name);
+    if (!pin) {
+      showLobbyError('Escribe tu clave para entrar al desempate.');
+      return;
+    }
+
+    sincronizarNombre(name);
+    setBusy(true);
+    clearLobbyError();
+
+    try {
+      const response = await O.joinRoom(code, name, pin);
+      setBusy(false);
+      if (!response.ok) {
+        enfocarPin(response.error, name, el.joinPin);
+        showLobbyError(errorText(response.error));
+        return;
+      }
+      guardarPin(name, pin);
+      myColor = response.color;
+      orientation = response.color;
+      room = response.room;
+      enterGame();
+      showToast('Desempate en vivo');
+    } catch (error) {
+      setBusy(false);
+      showLobbyError('Error de conexión con el servidor.');
+    }
+  }
+
   async function leaveGame(confirmFirst, options = {}) {
     const resign = options.resign !== false;
 
@@ -2631,6 +2760,23 @@
     showToast('Plazo ampliado.');
   });
 
+  /*
+   * Los dos jugadores han aceptado el desempate en vivo. Si estamos en la
+   * partida anterior (tablas), entramos a la sala nueva; si ya estamos en
+   * ella, solo se refresca la tarjeta.
+   */
+  O.on('vivo:listo', (payload) => {
+    if (!payload || !payload.code) return;
+    if (room && room.code === payload.code) {
+      showToast('Desempate en vivo: sin plazo, del tirón.');
+      renderVivoCard();
+      return;
+    }
+    showToast('¡Los dos habéis aceptado! Entrando al desempate en vivo…');
+    const destino = '/corespon/' + payload.code + '?auto=1';
+    window.setTimeout(() => { window.location.href = destino; }, 700);
+  });
+
   // ==================== EVENTOS DE UI ====================
 
   el.playerName.addEventListener('change', () => {
@@ -2689,6 +2835,31 @@
       return;
     }
     showToast('Has rechazado las tablas');
+  });
+
+  // Aceptar jugar el desempate en vivo. Desde la partida anterior se apunta
+  // a la sala nueva (`siguienteSala`); desde el propio desempate, a sí misma.
+  el.vivoBtn.addEventListener('click', async () => {
+    if (!room || isSpectator) return;
+    const code = (el.vivoBtn.dataset.code || room.siguienteSala || room.code || '')
+      .toUpperCase();
+    if (!code) return;
+
+    el.vivoBtn.disabled = true;
+    const respuesta = await O.aceptarVivo(code);
+    if (!respuesta.ok) {
+      el.vivoBtn.disabled = false;
+      showToast(errorText(respuesta.error), 'error');
+      return;
+    }
+
+    vivoSolicitado = true;
+    if (respuesta.listo) {
+      showToast('¡Desempate en vivo! Os toca jugar.');
+    } else {
+      showToast('Aceptado. Falta que acepte tu rival.');
+    }
+    renderVivoCard();
   });
 
   el.flipBtn.addEventListener('click', () => {
@@ -2763,6 +2934,7 @@
 
     const session = O.getSession();
     const urlCode = codeFromUrl();
+    const autoJoin = new URLSearchParams(window.location.search).get('auto') === '1';
     if (urlCode && watchFromUrl()) {
       el.codeInput.value = urlCode;
       watchGame(urlCode);
@@ -2770,6 +2942,7 @@
       attemptResume();
     } else if (urlCode) {
       el.codeInput.value = urlCode;
+      if (autoJoin) autoJoinRoom(urlCode);
     }
 
     const online = O.isConnected();

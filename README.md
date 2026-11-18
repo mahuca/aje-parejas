@@ -11,6 +11,7 @@ Torneo de ajedrez por correspondencia en formato **knockout de parejas**.
 - Se eligen los jugadores y se sortean **parejas y colores al azar**.
 - Cada pareja juega **una partida por ronda**; el perdedor queda eliminado.
 - Si hay **tablas**, se repite la partida con los colores cambiados hasta que haya ganador.
+- Tras unas tablas, la siguiente partida puede jugarse **en vivo**: si **los dos** aceptan, se juega del tirón, sin plazo y con el tablero abierto a cualquiera que tenga el enlace (`?ver=1`). Si no hay acuerdo, sigue como correspondencia.
 - Los ganadores se **re-emparejan al azar** en la ronda siguiente.
 - Si el número de jugadores es impar, **pasa libre el mejor clasificado** (rating; desempate por victorias y nombre).
 - El último que queda es el **campeón**.

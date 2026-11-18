@@ -216,6 +216,12 @@
     emitLocal('color', { color: payload.color, code: payload.code });
   });
 
+  // Los dos jugadores han aceptado jugar el desempate en vivo.
+  socket.on('corespon:vivo:listo', (payload) => {
+    if (!payload || typeof payload.code !== 'string') return;
+    emitLocal('vivo:listo', payload);
+  });
+
   // ==================== API ====================
 
   async function joinRoom(code, name, pin) {
@@ -298,6 +304,16 @@
   async function declineDraw(code) {
     if (!session) return { ok: false, error: 'no_session' };
     return request('corespon:draw:decline', { code, color: session.color });
+  }
+
+  /*
+   * Acepta jugar el desempate en vivo. `code` es la sala del desempate; el
+   * servidor identifica al jugador por su asiento actual.
+   */
+  async function aceptarVivo(code) {
+    if (!session) return { ok: false, error: 'no_session' };
+    if (!socket.connected) return { ok: false, error: 'offline' };
+    return request('corespon:vivo:aceptar', { code });
   }
 
   async function watch(code) {
@@ -397,6 +413,7 @@
     offerDraw,
     acceptDraw,
     declineDraw,
+    aceptarVivo,
     watch,
     stopWatching,
     reconnect: () => {

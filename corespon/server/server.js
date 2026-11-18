@@ -167,7 +167,8 @@ function createServer(options = {}) {
       const partidas = await store.getPartidasAbiertas();
       res.json({ ok: true, partidas: partidas.map(p => ({
         roomCode: p.roomCode, blancas: p.blancas, negras: p.negras,
-        turno: p.turno, plazoHasta: p.plazoHasta, creadoEn: p.creadoEn
+        turno: p.turno, plazoHasta: p.plazoHasta, creadoEn: p.creadoEn,
+        ritmo: p.ritmo || 'correspondencia'
       })) });
     } catch (error) {
       res.status(500).json({ ok: false, error: error.message });
@@ -477,6 +478,8 @@ function createServer(options = {}) {
       room.spectators.add(socket.id);
       socket.join(room.code);
       respond({ ok: true, room: room.toPublic() });
+      // Los jugadores ven el contador de espectadores al día (partida en vivo).
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
     });
 
     socket.on('corespon:unwatch', (data, respond) => {
@@ -486,6 +489,7 @@ function createServer(options = {}) {
       if (code) socket.leave(code);
       if (socket.data) socket.data.spectator = null;
       respond({ ok: true });
+      if (room) io.to(room.code).emit('corespon:room:update', room.toPublic());
     });
 
     // Movimiento
@@ -512,9 +516,13 @@ function createServer(options = {}) {
       io.to(room.code).emit('corespon:room:update', room.toPublic());
 
       if (!room.status.over) {
-        const host = baseUrl(socket);
-        // Le toca mover al jugador de turnColor(): ese es al que se avisa.
-        gateway.enqueue(room.code, TURNO, room.players[room.turnColor()], turnoMsg(room, room.turnColor(), host), host);
+        // En vivo los dos están delante del tablero: no hace falta avisar por
+        // Telegram de cada turno.
+        if (room.ritmo !== 'vivo') {
+          const host = baseUrl(socket);
+          // Le toca mover al jugador de turnColor(): ese es al que se avisa.
+          gateway.enqueue(room.code, TURNO, room.players[room.turnColor()], turnoMsg(room, room.turnColor(), host), host);
+        }
       } else {
         notificarFin(room, baseUrl(socket));
       }
@@ -633,6 +641,55 @@ function createServer(options = {}) {
       await persistRoom(room);
       io.to(room.code).emit('corespon:room:update', room.toPublic());
       respond({ ok: true, room: room.toPublic() });
+    });
+
+    /*
+     * Acuerdo para jugar el desempate en vivo. Cada jugador acepta desde su
+     * asiento (en la partida que acabó en tablas o ya en la sala nueva).
+     * Cuando aceptan los dos, la sala pasa a ritmo «vivo»: sin plazo y
+     * abierta a espectadores.
+     */
+    socket.on('corespon:vivo:aceptar', async (data, respond) => {
+      const room = rooms.getRoom(normalizeCode(data && data.code));
+      if (!room) return respond({ ok: false, error: 'not_found' });
+      if (room.status.over) return respond({ ok: false, error: 'game_over' });
+      if (!room.desempate && room.ritmo !== 'vivo') {
+        return respond({ ok: false, error: 'not_tiebreak' });
+      }
+
+      const ctx = socket.data && socket.data.corespon;
+      if (!ctx || !ctx.code) return respond({ ok: false, error: 'not_in_room' });
+      const origen = rooms.getRoom(ctx.code);
+      const asiento = origen && origen.players[ctx.color];
+      if (!asiento || !asiento.name) return respond({ ok: false, error: 'not_in_room' });
+
+      // El asiento de origen identifica al jugador dentro del desempate.
+      const color = room.colorForName(asiento.name);
+      if (!color) return respond({ ok: false, error: 'not_in_room' });
+
+      const result = room.aceptarVivo(color);
+      if (!result.ok) return respond(result);
+
+      await persistRoom(room);
+      io.to(room.code).emit('corespon:room:update', room.toPublic());
+
+      if (result.listo) {
+        try {
+          await torneo.marcarVivo(room.code);
+        } catch (error) {
+          if (!quiet) console.error('[corespon] No se pudo marcar el desempate en vivo:', error.message);
+        }
+        const aviso = { code: room.code, parentCode: room.parentCode || null };
+        io.to(room.code).emit('corespon:vivo:listo', aviso);
+        if (room.parentCode) io.to(room.parentCode).emit('corespon:vivo:listo', aviso);
+      }
+
+      respond({
+        ok: true,
+        code: room.code,
+        listo: result.listo,
+        vivoAceptado: result.vivoAceptado
+      });
     });
 
     /*
@@ -1674,7 +1731,14 @@ function createServer(options = {}) {
     // nueva; solo el modo 1v1 crea la revancha automática.
     try {
       const gestion = await torneo.alTerminar(room);
-      if (!gestion.gestionada) await crearVuelta(room, host);
+      if (!gestion.gestionada) {
+        await crearVuelta(room, host);
+      } else if (gestion.nuevaSala) {
+        // Tablas: la sala recién creada es el desempate. Se ofrece desde aquí
+        // el acuerdo para jugarlo en vivo.
+        room.siguienteSala = gestion.nuevaSala;
+        io.to(room.code).emit('corespon:room:update', room.toPublic());
+      }
     } catch (error) {
       if (!quiet) console.error('[corespon] Error registrando el final del torneo:', error.message);
     }
@@ -1744,8 +1808,8 @@ function createServer(options = {}) {
    * Crea la sala real de una partida del torneo de parejas y avisa a los dos
    * jugadores por Telegram. La usa el manager del torneo.
    */
-  async function crearSalaTorneo({ blanco, negro, ronda }) {
-    const room = rooms.createRoom(blanco, negro);
+  async function crearSalaTorneo({ blanco, negro, ronda, ritmo, desempate, parentCode }) {
+    const room = rooms.createRoom(blanco, negro, { ritmo, desempate, parentCode });
     await persistRoom(room);
 
     const host = baseUrl();
@@ -1769,6 +1833,7 @@ function createServer(options = {}) {
         snapshot: room.snapshot(),
         turno: room.turnColor(),
         estado: room.status.over ? 'terminada' : 'abierta',
+        ritmo: room.ritmo,
         resultado: room.status.over
           ? (room.status.winner === 'white' ? 'blancas'
             : room.status.winner === 'black' ? 'negras'

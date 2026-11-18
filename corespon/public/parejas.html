@@ -114,6 +114,16 @@
     .estado-p { color: var(--suave); }
     .estado-p.tablas { color: var(--ambar); }
     .estado-p.ganada { color: var(--verde); }
+    .badge-vivo {
+      display: inline-block; margin-left: 4px; padding: 1px 7px;
+      border-radius: 999px; background: rgba(239, 68, 68, .16);
+      border: 1px solid rgba(239, 68, 68, .45);
+      color: #ff9b9b; font-size: 11px; font-weight: 700;
+      animation: latido 1.6s ease-in-out infinite;
+    }
+    .acciones-partida { display: inline-flex; gap: 8px; align-items: center; }
+    .acciones-partida .ver { color: var(--suave); font-weight: 500; }
+    @keyframes latido { 50% { opacity: .55; } }
     .bye { color: var(--suave); font-style: italic; margin-top: 8px; }
 
     .lista-jugador { margin-top: 12px; display: grid; gap: 8px; }

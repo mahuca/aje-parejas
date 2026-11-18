@@ -186,6 +186,16 @@ class Room {
     this.history = [];
     this.spectators = new Set();
     this.parentCode = null;
+    // 'correspondencia' (con plazo de 2 días) o 'vivo' (sin reloj, se juega
+    // del tirón y cualquiera con el enlace puede mirar).
+    this.ritmo = 'correspondencia';
+    // Sala de desempate creada tras unas tablas.
+    this.desempate = false;
+    // Acuerdo para jugar el desempate en vivo: hace falta que acepten los dos.
+    this.vivoAceptado = { white: false, black: false };
+    // Código de la sala de desempate, para ofrecer el botón desde la partida
+    // que acaba de terminar en tablas.
+    this.siguienteSala = null;
     this.rematchVotes = { white: false, black: false };
     // Color que ha propuesto tablas y aún espera respuesta (null si no hay).
     this.drawOffer = null;
@@ -243,9 +253,25 @@ class Room {
 
   canExtend(now = Date.now()) {
     if (this.status.over) return false;
+    // En vivo no hay plazo que ampliar.
+    if (this.ritmo === 'vivo') return false;
     if (this.plazos.prorrogas.length >= MAX_PRORROGAS) return false;
     // Solo mientras el plazo normal no haya caducado
     return now < this.plazos.plazoHasta;
+  }
+
+  /*
+   * Acuerdo para jugar el desempate en vivo. Devuelve si ya hay consenso:
+   * hace falta que acepten los dos asientos.
+   */
+  aceptarVivo(color) {
+    if (color !== 'white' && color !== 'black') {
+      return { ok: false, error: 'invalid_color' };
+    }
+    this.vivoAceptado[color] = true;
+    const listo = !!(this.vivoAceptado.white && this.vivoAceptado.black);
+    if (listo) this.ritmo = 'vivo';
+    return { ok: true, listo, aceptado: true, vivoAceptado: { ...this.vivoAceptado } };
   }
 
   reiniciarPlazo(now = Date.now()) {
@@ -385,6 +411,10 @@ class Room {
     this.drawOffer = null;
     this.resultadoGuardado = false;
     this.vueltaCreada = true;
+    // La revancha 1v1 vuelve al ritmo normal.
+    this.ritmo = 'correspondencia';
+    this.vivoAceptado = { white: false, black: false };
+    this.siguienteSala = null;
     this.parentCode = this.parentCode || this.code;
     this.plazos = {
       plazoMs: PLAZO_DEFAULT_MS,
@@ -448,6 +478,10 @@ class Room {
       plazos: { ...this.plazos, prorrogas: this.plazos.prorrogas.slice() },
       timing: { ...this.timing, moves: this.timing.moves.slice() },
       parentCode: this.parentCode,
+      ritmo: this.ritmo,
+      desempate: this.desempate,
+      vivoAceptado: { ...this.vivoAceptado },
+      siguienteSala: this.siguienteSala,
       rematchVotes: { ...this.rematchVotes },
       drawOffer: this.drawOffer,
       resultadoGuardado: this.resultadoGuardado
@@ -520,6 +554,14 @@ class Room {
     }
 
     room.parentCode = typeof data.parentCode === 'string' ? data.parentCode : null;
+    room.ritmo = data.ritmo === 'vivo' ? 'vivo' : 'correspondencia';
+    room.desempate = !!data.desempate;
+    room.vivoAceptado = {
+      white: !!(data.vivoAceptado && data.vivoAceptado.white),
+      black: !!(data.vivoAceptado && data.vivoAceptado.black)
+    };
+    room.siguienteSala = typeof data.siguienteSala === 'string' && data.siguienteSala
+      ? data.siguienteSala : null;
     room.resultadoGuardado = !!data.resultadoGuardado;
     room.drawOffer = data.drawOffer === 'white' || data.drawOffer === 'black'
       ? data.drawOffer : null;
@@ -554,6 +596,11 @@ class Room {
       pgn: this.history.length ? buildPgn(this) : null,
       spectators: this.spectators.size,
       parentCode: this.parentCode,
+      ritmo: this.ritmo,
+      enVivo: this.ritmo === 'vivo',
+      desempate: this.desempate,
+      vivoAceptado: { ...this.vivoAceptado },
+      siguienteSala: this.siguienteSala,
       plazo: {
         plazoHasta: this.plazos.plazoHasta,
         graciaHasta: this.plazos.graciaHasta,
@@ -610,13 +657,16 @@ class RoomManager {
     return this.all().filter(room => !room.status.over);
   }
 
-  createRoom(whiteName, blackName) {
+  createRoom(whiteName, blackName, options = {}) {
     let code;
     do {
       code = randomCode();
     } while (this.rooms.has(code));
 
     const room = new Room(code, whiteName, blackName);
+    if (options.ritmo === 'vivo') room.ritmo = 'vivo';
+    room.desempate = !!options.desempate;
+    room.parentCode = options.parentCode || null;
     this.rooms.set(code, room);
     return room;
   }
@@ -689,6 +739,8 @@ class RoomManager {
     const perdidas = [];
     for (const room of this.rooms.values()) {
       if (room.status.over) continue;
+      // Las partidas en vivo no caducan: se juegan del tirón.
+      if (room.ritmo === 'vivo') continue;
       if (!room.caducado(now)) continue;
       room.perderPorTiempo();
       perdidas.push(room);
@@ -703,6 +755,7 @@ class RoomManager {
     const listas = [];
     for (const room of this.rooms.values()) {
       if (room.status.over) continue;
+      if (room.ritmo === 'vivo') continue;
       if (room.plazos.recordado) continue;
       const restante = room.plazos.plazoHasta - now;
       if (restante <= RECORDATORIO_UMBRAL_MS) {

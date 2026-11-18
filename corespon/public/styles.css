@@ -1245,6 +1245,15 @@ body.is-spectator .square { cursor: default; }
 .plazo-details span { color: var(--muted); font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .plazo-card .btn-sm { padding: 6px 10px; font-size: 0.72rem; }
 
+/* Desempate / partida en vivo */
+.vivo-card {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.vivo-card .plazo-details strong { color: #ff9b9b; }
+.vivo-card .btn-primary { white-space: nowrap; }
+.vivo-card.is-live { background: rgba(239, 68, 68, 0.12); }
+
 /* ==================== LISTA DE PARTIDAS ==================== */
 .partidas-list { display: flex; flex-direction: column; gap: 10px; }
 
@@ -1279,6 +1288,14 @@ body.is-spectator .square { cursor: default; }
   border-radius: 999px; background: rgba(240,199,94,0.1); color: var(--accent);
   font-size: 0.76rem; white-space: nowrap;
 }
+
+.vivo-badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px;
+  border-radius: 999px; background: rgba(239,68,68,0.16);
+  border: 1px solid rgba(239,68,68,0.4); color: #ff9b9b;
+  font-size: 0.76rem; font-weight: 700; white-space: nowrap;
+}
+.partida-item.en-vivo { border-color: rgba(239,68,68,0.45); }
 
 /* ==================== CLASIFICACIÓN ==================== */
 .clasificacion-list { margin-top: 12px; }

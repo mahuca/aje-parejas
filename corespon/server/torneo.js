@@ -114,6 +114,8 @@ function publico(torneo) {
     blanco: p.blanco,
     negro: p.negro,
     estado: p.estado,
+    ritmo: p.ritmo || 'correspondencia',
+    desempate: !!p.desempate,
     resultado: p.resultado || null,
     ganador: p.ganador || null,
     roomCode: p.roomCode,
@@ -205,7 +207,7 @@ function crearTorneoManager(options = {}) {
    * Crea una partida nueva (sala real) y la añade al torneo.
    * `colores` decide quién lleva blancas; si no se indica, se sortea.
    */
-  async function crearPartida(torneo, { ronda, matchId, juego, a, b }) {
+  async function crearPartida(torneo, { ronda, matchId, juego, a, b, ritmo, desempate, parentCode }) {
     let blanco = a;
     let negro = b;
     // La primera partida de cada pareja sortea color. Los desempates llegan
@@ -223,7 +225,10 @@ function crearTorneoManager(options = {}) {
       ronda,
       juego: juego || 1,
       matchId,
-      torneoId: torneo.id
+      torneoId: torneo.id,
+      ritmo: ritmo || 'correspondencia',
+      desempate: !!desempate,
+      parentCode: parentCode || null
     });
 
     const partida = {
@@ -234,6 +239,8 @@ function crearTorneoManager(options = {}) {
       blanco,
       negro,
       roomCode: sala.code,
+      ritmo: ritmo === 'vivo' ? 'vivo' : 'correspondencia',
+      desempate: !!desempate,
       estado: 'pendiente',
       resultado: null,
       ganador: null,
@@ -378,7 +385,9 @@ function crearTorneoManager(options = {}) {
           matchId: partida.matchId,
           juego: partida.juego + 1,
           a: partida.negro,
-          b: partida.blanco
+          b: partida.blanco,
+          desempate: true,
+          parentCode: room.code
         });
         siguiente.juego = partida.juego + 1;
         await guardar(torneo);
@@ -505,10 +514,27 @@ function crearTorneoManager(options = {}) {
     );
   }
 
+  /*
+   * Marca la partida del torneo como «en vivo» cuando los dos jugadores
+   * aceptan jugar el desempate del tirón. Solo cambia la etiqueta pública.
+   */
+  async function marcarVivo(roomCode) {
+    return conBloqueo(async () => {
+      await cargar();
+      if (!actual) return null;
+      const partida = actual.partidas.find((p) => p.roomCode === roomCode);
+      if (!partida || partida.ritmo === 'vivo') return publico(actual);
+      partida.ritmo = 'vivo';
+      await guardar(actual);
+      return publico(actual);
+    });
+  }
+
   return {
     cargar,
     crearTorneo,
     alTerminar,
+    marcarVivo,
     esSalaDeTorneo,
     obtenerActual,
     obtener,

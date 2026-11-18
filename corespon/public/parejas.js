@@ -86,9 +86,11 @@ function tarjetaPartida(grupo) {
   }
 
   const desempate = p.juego > 1 ? ' · desempate ' + (p.juego - 1) : '';
+  const vivo = p.ritmo === 'vivo' ? ' <span class="badge-vivo">🔴 En vivo</span>' : '';
   const enlace = !nombreGanador
-    ? `<a href="${esc(p.enlace)}">Abrir partida →</a>`
-    : `<span class="suave">Partida cerrada</span>`;
+    ? `<span class="acciones-partida"><a href="${esc(p.enlace)}">Abrir partida →</a>`
+      + `<a class="ver" href="${esc(p.enlace)}?ver=1">Ver</a></span>`
+    : `<a class="ver" href="${esc(p.enlace)}?ver=1">Ver →</a>`;
 
   return `
     <article class="partida">
@@ -99,7 +101,7 @@ function tarjetaPartida(grupo) {
         <span>${esc(p.negro)}</span><span class="color">♚ negras</span>
       </div>
       <div class="pie">
-        <span class="estado-p ${claseEstado}">${esc(estado)}${esc(desempate)}</span>
+        <span class="estado-p ${claseEstado}">${esc(estado)}${esc(desempate)}${vivo}</span>
         ${enlace}
       </div>
     </article>`;
@@ -338,7 +340,7 @@ async function buscarJugador() {
       else if (p.estado === 'tablas') estado = 'Tablas · desempate';
       return `<div class="fila-juego">
         <span>Ronda ${p.ronda} · contra <strong>${esc(rival)}</strong> con ${color}${p.juego > 1 ? ' · desempate' : ''}</span>
-        <span>${esc(estado)}${p.ganador ? '' : ' · <a href="' + esc(p.enlace) + '">jugar →</a>'}</span>
+        <span>${esc(estado)}${p.ganador ? '' : ' · <a href="' + esc(p.enlace) + '">jugar →</a>'} · <a href="${esc(p.enlace)}?ver=1">ver</a></span>
       </div>`;
     }).join('');
   } catch (error) {

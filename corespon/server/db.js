@@ -61,6 +61,9 @@ const SCHEMA = [
   // restaurar una partida tras un reinicio del servidor.
   `ALTER TABLE corespon_partidas ADD COLUMN IF NOT EXISTS snapshot JSONB`,
 
+  // 'correspondencia' | 'vivo'. Las salas viejas se quedan en correspondencia.
+  `ALTER TABLE corespon_partidas ADD COLUMN IF NOT EXISTS ritmo TEXT NOT NULL DEFAULT 'correspondencia'`,
+
   // Ajustes sueltos del torneo (por ejemplo, hasta cuándo está abierta el alta
   // de claves personales). Se guardan como texto para no crear una columna por
   // cada ajuste futuro.
@@ -167,6 +170,7 @@ function emptyPartida(record) {
     snapshot: record.snapshot || null,
     turno: record.turno,
     estado: record.estado,
+    ritmo: record.ritmo || 'correspondencia',
     resultado: record.resultado || null,
     creadoEn: iso(pick(record, 'creado_en', 'creadoEn')),
     movidaEn: iso(pick(record, 'movida_en', 'movidaEn')),
@@ -664,8 +668,9 @@ function createPostgresStore(connectionString, options = {}) {
       const { rows } = await pool.query(
         `INSERT INTO corespon_partidas
           (room_code, blancas, negras, fen, pgn, snapshot, turno, estado, resultado,
-           creado_en, movida_en, plazo_hasta, gracia_hasta, prorrogas, ultima_prorroga_hasta)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+           creado_en, movida_en, plazo_hasta, gracia_hasta, prorrogas, ultima_prorroga_hasta,
+           ritmo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          ON CONFLICT (room_code) DO UPDATE SET
            fen = EXCLUDED.fen, pgn = EXCLUDED.pgn, snapshot = EXCLUDED.snapshot,
            turno = EXCLUDED.turno,
@@ -676,7 +681,8 @@ function createPostgresStore(connectionString, options = {}) {
            estado = EXCLUDED.estado, resultado = EXCLUDED.resultado,
            movida_en = EXCLUDED.movida_en, plazo_hasta = EXCLUDED.plazo_hasta,
            gracia_hasta = EXCLUDED.gracia_hasta, prorrogas = EXCLUDED.prorrogas,
-           ultima_prorroga_hasta = EXCLUDED.ultima_prorroga_hasta
+           ultima_prorroga_hasta = EXCLUDED.ultima_prorroga_hasta,
+           ritmo = EXCLUDED.ritmo
          RETURNING *`,
         [
           partida.roomCode, partida.blancas, partida.negras, partida.fen || null,
@@ -687,7 +693,8 @@ function createPostgresStore(connectionString, options = {}) {
           partida.plazoHasta ? new Date(partida.plazoHasta).toISOString() : null,
           partida.graciaHasta ? new Date(partida.graciaHasta).toISOString() : null,
           JSON.stringify(partida.prorrogas || []),
-          partida.ultimaProrrogaHasta ? new Date(partida.ultimaProrrogaHasta).toISOString() : null
+          partida.ultimaProrrogaHasta ? new Date(partida.ultimaProrrogaHasta).toISOString() : null,
+          partida.ritmo === 'vivo' ? 'vivo' : 'correspondencia'
         ]
       );
       return emptyPartida(rows[0]);
