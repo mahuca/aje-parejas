@@ -26,7 +26,7 @@
 - **Servidor:** `server.js` — entrada Node/Express + Socket.IO. Escucha en `PORT=3001`.
 - **Rutas principales:** `corespon/server/server.js` (HTTP + Socket.IO), `corespon/server/rooms.js` (reglas de sala), `corespon/server/db.js` (store), `corespon/server/classification.js` (ranking 1500±25), `corespon/server/telegram.js` (notificaciones Telegram).
 - **Cliente:** `corespon/public/` — HTML/JS del tablero (`corespon.html`, `online-core.js`, `corespon.js`).
-- **Tests:** `corespon/tests/server.test.js` (integración general) y `corespon/tests/torneo.test.js` (sorteo, bye por clasificación, desempate por tablas, avance de rondas y flujo real por socket, sala en vivo y acuerdo del desempate). 139 en total. Se ejecutan con `cd corespon && node --test tests/*.test.js`.
+- **Tests:** `corespon/tests/server.test.js` (integración general) y `corespon/tests/torneo.test.js` (sorteo, bye por sorteo, desempate por tablas, avance de rondas y flujo real por socket, sala en vivo y acuerdo del desempate). 139 en total. Se ejecutan con `cd corespon && node --test tests/*.test.js`.
 
 ---
 
@@ -105,7 +105,7 @@
 - **Página:** `GET /parejas` (`corespon/public/parejas.html` + `parejas.js`); `/` redirige ahí.
 - **Crear:** `POST /api/parejas/torneos` con `{ "nombres": ["Ana", "Luis", ...] }` (2–16). Exige `x-admin-token` solo si `ADMIN_TOKEN` está definido. Crea las salas reales del sorteo y abre el alta de claves 72 h (`{ "horasAlta": 0 }` para no abrirla).
 - **Consultar:** `GET /api/parejas/torneos/actual`, `GET /api/parejas/torneos/:id`, `GET /api/parejas/torneos` (historial) y `GET /api/parejas/jugador/:nombre` (partidas de un jugador con enlace a su sala).
-- **Reglas:** sorteo aleatorio de parejas y colores; tablas → revancha con colores cambiados (se repite hasta que alguien gane); ganadores re-emparejados al azar; si el número es impar **pasa libre el mejor clasificado** (rating; desempate por victorias y nombre, no por sorteo); el último que queda es el campeón.
+- **Reglas:** sorteo aleatorio de parejas y colores; tablas → revancha con colores cambiados (se repite hasta que alguien gane); ganadores re-emparejados al azar; si el número es impar **el bye también se sortea** al azar entre los que quedan; el último que queda es el campeón.
 - **Desempate en vivo (por acuerdo):** cuando una partida acaba en tablas, la sala nueva ofrece el botón **«Jugar el desempate ahora»**. Hace falta que acepten **los dos** (`corespon:vivo:aceptar`); entonces la sala pasa a `ritmo:'vivo'`, **sin plazo ni caducidad**, no ofrece prórroga ni avisa por Telegram de cada turno, y cualquiera con el enlace puede mirarla (`?ver=1`). Si no aceptan los dos, el desempate sigue como correspondencia normal. El cuadro muestra el badge **🔴 En vivo** y un enlace **Ver** a cada partida abierta.
 - **Estado:** JSON en `corespon_ajustes` (`parejas_torneo_actual`, `parejas_torneo_lista`, `parejas_torneo:<id>`), así funciona con Postgres y con memoria.
 - **Hook:** `notificarFin()` llama a `torneo.alTerminar(room)`; si la sala no es del torneo, sigue el flujo 1v1 (`crearVuelta`). `crearVuelta` y `crearVueltasPendientes` ignoran las salas del torneo (`roomCode` guardado en `corespon_resultados`).

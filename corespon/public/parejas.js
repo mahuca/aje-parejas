@@ -20,6 +20,14 @@ function esc(valor) {
     .replace(/"/g, '&quot;');
 }
 
+// Texto del bye: los torneos nuevos lo sortean; los antiguos lo daban al
+// mejor clasificado.
+function textoBye(bye) {
+  return bye && bye.motivo === 'mejor-clasificado'
+    ? 'pasa libre por mejor clasificación'
+    : 'pasa libre por sorteo';
+}
+
 function aviso(texto, tipo) {
   const caja = $('aviso');
   caja.textContent = texto;
@@ -132,7 +140,7 @@ function pintarCuadro(torneo) {
       html += '<div class="partidas">' + grupos.map(tarjetaPartida).join('') + '</div>';
     }
     for (const bye of byes) {
-      html += `<p class="bye">Sin rival (número impar): ${esc(bye.nombre)} pasa libre por mejor clasificación.</p>`;
+      html += `<p class="bye">Sin rival (número impar): ${esc(bye.nombre)} ${textoBye(bye)}.</p>`;
     }
     if (!grupos.length && !byes.length) {
       html += '<p class="vacío">Sin partidas en esta ronda.</p>';
@@ -209,7 +217,7 @@ function pintarSorteo(torneo) {
   const libres = byes.map((b) => `
     <div class="emparejamiento">
       <span>${esc(b.nombre)}</span>
-      <span class="color">sin rival (impar) · pasa libre por mejor clasificación</span>
+      <span class="color">sin rival (impar) · ${textoBye(b)}</span>
     </div>`).join('');
 
   caja.innerHTML = `<p class="sorteo-titulo">🎲 Sorteo de la ronda ${ronda}</p>

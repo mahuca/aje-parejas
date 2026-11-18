@@ -185,28 +185,31 @@ test('bye: con impares uno pasa libre y se une a la ronda siguiente', async () =
   assert.ok([final.blanco, final.negro].includes(torneo.byes[0].nombre));
 });
 
-test('bye: pasa libre el jugador que decida el criterio, no el azar', async () => {
+test('bye: el jugador que pasa libre se sortea entre los que quedan', async () => {
   const store = createMemoryStore();
   let n = 0;
   const manager = crearTorneoManager({
     store,
     crearSala: async () => ({ code: 'C' + (++n) }),
-    abrirAlta: async () => ({}),
-    elegirBye: async () => 'Marta'
+    abrirAlta: async () => ({})
   });
 
-  await manager.crearTorneo({ nombres: ['Ana', 'Luis', 'Marta'] });
+  const nombres = ['Ana', 'Luis', 'Marta'];
+  await manager.crearTorneo({ nombres });
   const torneo = await manager.obtenerActual();
 
   assert.equal(torneo.byes.length, 1);
-  assert.equal(torneo.byes[0].nombre, 'Marta');
-  assert.equal(torneo.byes[0].motivo, 'mejor-clasificado');
+  assert.equal(torneo.byes[0].motivo, 'sorteo');
+  const bye = torneo.byes[0].nombre;
+  assert.ok(nombres.includes(bye));
+
   assert.equal(torneo.partidas.length, 1);
-  assert.ok(![torneo.partidas[0].blanco, torneo.partidas[0].negro]
-    .some((nombre) => nombre === 'Marta'));
+  const { blanco, negro } = torneo.partidas[0];
+  assert.equal([blanco, negro].includes(bye), false);
+  assert.deepEqual([blanco, negro, bye].sort(), nombres.slice().sort());
 });
 
-test('API: con impares pasa libre el mejor clasificado', async (t) => {
+test('API: con impares el bye se sortea y los otros dos juegan', async (t) => {
   const store = createMemoryStore();
   await store.setAjuste('alta_claves_hasta', new Date(Date.now() + 3600000).toISOString());
 
@@ -215,18 +218,24 @@ test('API: con impares pasa libre el mejor clasificado', async (t) => {
   const port = await instance.start(0);
   const base = 'http://127.0.0.1:' + port;
 
-  // Todos empiezan con 1500 y 0 victorias: desempata el nombre.
+  const nombres = ['Luis', 'Marta', 'Ana'];
   const res = await fetch(base + '/api/parejas/torneos', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ nombres: ['Luis', 'Marta', 'Ana'] })
+    body: JSON.stringify({ nombres })
   });
   const datos = await res.json();
 
   assert.equal(res.status, 201);
   assert.equal(datos.torneo.byes.length, 1);
-  assert.equal(datos.torneo.byes[0].nombre, 'Ana');
+  assert.equal(datos.torneo.byes[0].motivo, 'sorteo');
+  const bye = datos.torneo.byes[0].nombre;
+  assert.ok(nombres.includes(bye));
+
   assert.equal(datos.torneo.partidas.length, 1);
+  const { blanco, negro } = datos.torneo.partidas[0];
+  assert.equal([blanco, negro].includes(bye), false);
+  assert.deepEqual([blanco, negro, bye].sort(), nombres.slice().sort());
 });
 
 test('API: crea el torneo y devuelve las salas con enlace', async (t) => {

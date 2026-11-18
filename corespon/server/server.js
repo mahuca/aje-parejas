@@ -98,7 +98,6 @@ function createServer(options = {}) {
     store,
     crearSala: crearSalaTorneo,
     abrirAlta: abrirAltaClaves,
-    elegirBye: elegirByeMejorClasificado,
     log
   });
 
@@ -1780,28 +1779,6 @@ function createServer(options = {}) {
       if (!quiet) console.error('[corespon] Error guardando el resultado', room.code + ':', error.message);
       return null;
     }
-  }
-
-  /*
-   * Jugador que pasa libre cuando el número es impar: el mejor clasificado.
-   * computeClassification ya ordena por rating, victorias y nombre, así que
-   * ante un empate inicial (todos 1500) decide el orden alfabético.
-   */
-  async function elegirByeMejorClasificado(nombres) {
-    try {
-      const [resultados, jugadores] = await Promise.all([
-        store.getResultados(),
-        store.getPlayers()
-      ]);
-      const tabla = computeClassification(resultados, jugadores);
-      const enJuego = new Set((nombres || []).map((n) => n.toLowerCase()));
-      for (const fila of tabla) {
-        if (enJuego.has(fila.nombre.toLowerCase())) return fila.nombre;
-      }
-    } catch (error) {
-      if (!quiet) console.error('[corespon] No se pudo elegir el bye:', error.message);
-    }
-    return (nombres && nombres[0]) || null;
   }
 
   /*

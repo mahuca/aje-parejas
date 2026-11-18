@@ -73,26 +73,17 @@ function limpiarNombres(nombres) {
 }
 
 /*
- * Empareja una lista de nombres. Si es impar, uno pasa libre. Se puede indicar
- * qué jugador debe pasar libre (por ejemplo, el mejor clasificado); si no se
- * indica o no está en la lista, se elige al azar.
+ * Empareja una lista de nombres al azar. Si es impar, uno pasa libre: el
+ * último del sorteo. No se elige por clasificación (en la primera ronda todos
+ * parten con 1500 y 0 victorias).
  * Devuelve { parejas, bye }.
  */
-function sortearParejas(nombres, rng = Math.random, byePreferido = null) {
+function sortearParejas(nombres, rng = Math.random) {
   const resto = shuffle(nombres, rng);
   const parejas = [];
   let bye = null;
 
-  if (resto.length % 2 === 1) {
-    if (byePreferido) {
-      const indice = resto.findIndex((nombre) => mismoNombre(nombre, byePreferido));
-      if (indice >= 0) {
-        bye = resto[indice];
-        resto.splice(indice, 1);
-      }
-    }
-    if (!bye) bye = resto.pop();
-  }
+  if (resto.length % 2 === 1) bye = resto.pop();
 
   for (let i = 0; i + 1 < resto.length; i += 2) {
     parejas.push([resto[i], resto[i + 1]]);
@@ -145,7 +136,7 @@ function publico(torneo) {
 }
 
 function crearTorneoManager(options = {}) {
-  const { store, crearSala, abrirAlta, elegirBye, log = () => {} } = options;
+  const { store, crearSala, abrirAlta, log = () => {} } = options;
   if (!store) throw new Error('torneo: falta el store');
   if (typeof crearSala !== 'function') throw new Error('torneo: falta crearSala');
   if (typeof abrirAlta !== 'function') throw new Error('torneo: falta abrirAlta');
@@ -267,13 +258,11 @@ function crearTorneoManager(options = {}) {
       return [];
     }
 
-    const byeElegido = (clasificados.length % 2 === 1 && typeof elegirBye === 'function')
-      ? await elegirBye(clasificados)
-      : null;
-
-    const { parejas, bye } = sortearParejas(clasificados, Math.random, byeElegido);
+    // Con número impar, el bye también entra en el sorteo: no depende de la
+    // clasificación (en la primera ronda todos parten con 1500 y 0 victorias).
+    const { parejas, bye } = sortearParejas(clasificados);
     if (bye) {
-      torneo.byes.push({ ronda, nombre: bye, motivo: 'mejor-clasificado' });
+      torneo.byes.push({ ronda, nombre: bye, motivo: 'sorteo' });
     }
 
     const creadas = [];
