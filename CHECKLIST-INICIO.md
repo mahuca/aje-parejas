@@ -45,6 +45,7 @@ Cuadro: `/parejas` · Lobby: `/corespon`
 - [ ] El **plazo de 2 días** empieza cuando **los dos** jugadores han entrado en la sala.
 - [ ] Telegram avisa del turno al jugador que debe mover y del fin de partida.
 - [ ] «Partidas abiertas» ordena por plazo y agrupa: *Te toca mover*, *Esperando al rival* y *Otras partidas*.
+- [ ] **Bye (número impar):** al quedar un número impar de jugadores (con 6, en la ronda 2) comprobar que hay **una partida menos** y un jugador que **«pasa libre por sorteo»**. Ese jugador no tiene sala esa ronda y vuelve en la siguiente.
 
 ## Tablas y desempate
 
