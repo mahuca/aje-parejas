@@ -54,9 +54,15 @@ const MESSAGES = {
     'listo.\n\nEntra a jugar: ${host}/corespon/${code}',
 
   parejas:
-    '♟ *Torneo de parejas, ${jugador}*\n\nTe toca jugar la ronda ${ronda} ' +
+    '♟ *Torneo de parejas, ${jugador}*\n\nTe toca jugar ${etapa} de la ronda ${ronda} ' +
     'contra ${rival}, con ${color}, en la partida ${code}.\n\n' +
-    'Entra a jugar: ${host}/corespon/${code}'
+    'Entra a jugar: ${host}/corespon/${code}',
+
+  desempate:
+    '⏳ *Desempate por correspondencia, ${jugador}*\n\nEl desempate de la ' +
+    'partida ${code} no se ha jugado en vivo en 24 h. Sigue como ' +
+    'correspondencia: 2 días por jugada.\n\nEntra a jugar: ' +
+    '${host}/corespon/${code}'
 };
 
 // ============================ TELEGRAM ============================
@@ -440,6 +446,22 @@ function parejasMsg(room, color, host, extra = {}) {
       color: color === 'white' ? 'blancas' : 'negras',
       code: room.code,
       ronda: extra.ronda || 1,
+      etapa: extra.etapa || 'la partida',
+      host
+    }
+  };
+}
+
+/*
+ * Aviso de que el desempate en vivo no arrancó: sigue por correspondencia.
+ */
+function desempateMsg(room, color, host) {
+  return {
+    tipo: 'desempate',
+    vars: {
+      jugador: jugadorDe(room, color),
+      rival: rivalDe(room, color),
+      code: room.code,
       host
     }
   };
@@ -462,6 +484,7 @@ module.exports = {
   FIN: 'fin',
   VUELTA: 'vuelta',
   PAREJAS: 'parejas',
+  DESEMPATE: 'desempate',
   invitacionMsg,
   turnoMsg,
   recordatorioMsg,
@@ -469,5 +492,6 @@ module.exports = {
   tiempoMsg,
   finMsg,
   vueltaMsg,
-  parejasMsg
+  parejasMsg,
+  desempateMsg
 };

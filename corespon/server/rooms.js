@@ -189,10 +189,8 @@ class Room {
     // 'correspondencia' (con plazo de 2 días) o 'vivo' (sin reloj, se juega
     // del tirón y cualquiera con el enlace puede mirar).
     this.ritmo = 'correspondencia';
-    // Sala de desempate creada tras unas tablas.
+    // Sala de desempate creada tras un cruce igualado.
     this.desempate = false;
-    // Acuerdo para jugar el desempate en vivo: hace falta que acepten los dos.
-    this.vivoAceptado = { white: false, black: false };
     // Código de la sala de desempate, para ofrecer el botón desde la partida
     // que acaba de terminar en tablas.
     this.siguienteSala = null;
@@ -261,17 +259,13 @@ class Room {
   }
 
   /*
-   * Acuerdo para jugar el desempate en vivo. Devuelve si ya hay consenso:
-   * hace falta que acepten los dos asientos.
+   * El desempate en vivo no ha terminado dentro del tope: sigue como
+   * correspondencia, con el plazo normal de 2 días desde ahora.
    */
-  aceptarVivo(color) {
-    if (color !== 'white' && color !== 'black') {
-      return { ok: false, error: 'invalid_color' };
-    }
-    this.vivoAceptado[color] = true;
-    const listo = !!(this.vivoAceptado.white && this.vivoAceptado.black);
-    if (listo) this.ritmo = 'vivo';
-    return { ok: true, listo, aceptado: true, vivoAceptado: { ...this.vivoAceptado } };
+  pasarACorrespondencia(now = Date.now()) {
+    this.ritmo = 'correspondencia';
+    this.reiniciarPlazo(now);
+    return this;
   }
 
   reiniciarPlazo(now = Date.now()) {
@@ -413,7 +407,6 @@ class Room {
     this.vueltaCreada = true;
     // La revancha 1v1 vuelve al ritmo normal.
     this.ritmo = 'correspondencia';
-    this.vivoAceptado = { white: false, black: false };
     this.siguienteSala = null;
     this.parentCode = this.parentCode || this.code;
     this.plazos = {
@@ -480,7 +473,6 @@ class Room {
       parentCode: this.parentCode,
       ritmo: this.ritmo,
       desempate: this.desempate,
-      vivoAceptado: { ...this.vivoAceptado },
       siguienteSala: this.siguienteSala,
       rematchVotes: { ...this.rematchVotes },
       drawOffer: this.drawOffer,
@@ -556,10 +548,6 @@ class Room {
     room.parentCode = typeof data.parentCode === 'string' ? data.parentCode : null;
     room.ritmo = data.ritmo === 'vivo' ? 'vivo' : 'correspondencia';
     room.desempate = !!data.desempate;
-    room.vivoAceptado = {
-      white: !!(data.vivoAceptado && data.vivoAceptado.white),
-      black: !!(data.vivoAceptado && data.vivoAceptado.black)
-    };
     room.siguienteSala = typeof data.siguienteSala === 'string' && data.siguienteSala
       ? data.siguienteSala : null;
     room.resultadoGuardado = !!data.resultadoGuardado;
@@ -599,7 +587,6 @@ class Room {
       ritmo: this.ritmo,
       enVivo: this.ritmo === 'vivo',
       desempate: this.desempate,
-      vivoAceptado: { ...this.vivoAceptado },
       siguienteSala: this.siguienteSala,
       plazo: {
         plazoHasta: this.plazos.plazoHasta,

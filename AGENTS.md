@@ -12,7 +12,7 @@
 | Instalar dependencias | `npm install` |
 | Iniciar servidor (producción) | `npm start` |
 | Modo desarrollo (auto-reload) | `npm run dev` |
-| Ejecutar tests (139 tests) | `npm test` |
+| Ejecutar tests (143 tests) | `npm test` |
 | Crear roster en Postgres | `npm run init-db` |
 | Ver cola de notificaciones (admin) | `curl -H "x-admin-token: $ADMIN_TOKEN" "https://<url>/api/telegram/queue"` |
 | Health check | `curl https://<url>/healthz` |
@@ -26,7 +26,7 @@
 - **Servidor:** `server.js` — entrada Node/Express + Socket.IO. Escucha en `PORT=3001`.
 - **Rutas principales:** `corespon/server/server.js` (HTTP + Socket.IO), `corespon/server/rooms.js` (reglas de sala), `corespon/server/db.js` (store), `corespon/server/classification.js` (ranking 1500±25), `corespon/server/telegram.js` (notificaciones Telegram).
 - **Cliente:** `corespon/public/` — HTML/JS del tablero (`corespon.html`, `online-core.js`, `corespon.js`).
-- **Tests:** `corespon/tests/server.test.js` (integración general) y `corespon/tests/torneo.test.js` (sorteo, bye por sorteo, desempate por tablas, avance de rondas y flujo real por socket, sala en vivo y acuerdo del desempate). 139 en total. Se ejecutan con `cd corespon && node --test tests/*.test.js`.
+- **Tests:** `corespon/tests/server.test.js` (integración general) y `corespon/tests/torneo.test.js` (sorteo, bye por sorteo, marcador ida/vuelta, desempate en vivo y tope de 24 h, avance de rondas y flujo real por socket). 143 en total. Se ejecutan con `cd corespon && node --test tests/*.test.js`.
 
 ---
 
@@ -105,8 +105,8 @@
 - **Página:** `GET /parejas` (`corespon/public/parejas.html` + `parejas.js`); `/` redirige ahí.
 - **Crear:** `POST /api/parejas/torneos` con `{ "nombres": ["Ana", "Luis", ...] }` (2–16). Exige `x-admin-token` solo si `ADMIN_TOKEN` está definido. Crea las salas reales del sorteo y abre el alta de claves 72 h (`{ "horasAlta": 0 }` para no abrirla).
 - **Consultar:** `GET /api/parejas/torneos/actual`, `GET /api/parejas/torneos/:id`, `GET /api/parejas/torneos` (historial) y `GET /api/parejas/jugador/:nombre` (partidas de un jugador con enlace a su sala).
-- **Reglas:** sorteo aleatorio de parejas y colores; tablas → revancha con colores cambiados (se repite hasta que alguien gane); ganadores re-emparejados al azar; si el número es impar **el bye también se sortea** al azar entre los que quedan; el último que queda es el campeón.
-- **Desempate en vivo (por acuerdo):** cuando una partida acaba en tablas, la sala nueva ofrece el botón **«Jugar el desempate ahora»**. Hace falta que acepten **los dos** (`corespon:vivo:aceptar`); entonces la sala pasa a `ritmo:'vivo'`, **sin plazo ni caducidad**, no ofrece prórroga ni avisa por Telegram de cada turno, y cualquiera con el enlace puede mirarla (`?ver=1`). Si no aceptan los dos, el desempate sigue como correspondencia normal. El cuadro muestra el badge **🔴 En vivo** y un enlace **Ver** a cada partida abierta.
+- **Reglas:** sorteo aleatorio de parejas y colores; cada cruce son **dos partidas** (ida y vuelta, colores cambiados; la vuelta se crea al acabar la ida en sala nueva); **victoria 1 punto, tablas 0,5**, pasa quien más tiene; con 1–1 se juega un desempate; ganadores re-emparejados al azar; si el número es impar **el bye también se sortea** al azar entre los que quedan; el último que queda es el campeón. `formato:'ida-vuelta'` distingue los torneos nuevos de los antiguos (una partida por cruce).
+- **Desempate en vivo:** el desempate (partida 3 en adelante) se crea ya con `ritmo:'vivo'` — **sin acuerdo previo, sin plazo ni caducidad**, sin prórroga y sin avisos de turno por Telegram; cualquiera con el enlace puede mirarlo (`?ver=1`). Las tablas en el desempate crean otra partida en vivo. `desempatesVencidos()` (`torneo.js`), llamado desde el intervalo de plazos en `server.js`, lo pasa a **correspondencia con 2 días si no hay ganador en 24 h** (`Room.pasarACorrespondencia()`) y avisa por Telegram. El cuadro muestra el badge **🔴 En vivo**, el marcador del cruce y un enlace por partida. Ya no existen `corespon:vivo:aceptar` ni `vivoAceptado`.
 - **Estado:** JSON en `corespon_ajustes` (`parejas_torneo_actual`, `parejas_torneo_lista`, `parejas_torneo:<id>`), así funciona con Postgres y con memoria.
 - **Hook:** `notificarFin()` llama a `torneo.alTerminar(room)`; si la sala no es del torneo, sigue el flujo 1v1 (`crearVuelta`). `crearVuelta` y `crearVueltasPendientes` ignoran las salas del torneo (`roomCode` guardado en `corespon_resultados`).
 - **No** se generan partidas round-robin al arrancar: `server.js` raíz usa `completarAlArrancar: false`.
@@ -123,7 +123,7 @@
 
 ### Tests
 
-- 139 tests en verde: integración general en `server.test.js` y torneo en `torneo.test.js` (sorteo, bye por mejor clasificación, tablas, avance de rondas, rendición, tablas por socket y desempate en vivo).
+- 143 tests en verde: integración general en `server.test.js` y torneo en `torneo.test.js` (sorteo y bye aleatorio, marcador ida/vuelta, desempate en vivo con tope de 24 h, avance de rondas y campeón, flujo real por socket).
 - Los tests usan `pg-mem` (Postgres en memoria) y un proveedor falso de notificaciones.
 - Para testear contra Neon antes de fiar una migración, conviene tener `DATABASE_URL` puesta.
 - Ejecutar: `cd corespon && node --test tests/*.test.js`.
@@ -153,6 +153,6 @@
 - Servidor: `corespon:leave` con `resign:false` solo desconecta el asiento; solo `resign:true` rinde.
 - Etiquetas: `"<rival> aún no ha entrado"` / `"Rival sin conexión (la partida sigue)"`.
 - Bug del aviso de turno: ahora avisa al jugador que le toca, no al que se movió.
-- 139 tests en verde tras fixes.
+- 143 tests en verde tras el cambio a ida y vuelta con desempate en vivo.
 
 ---

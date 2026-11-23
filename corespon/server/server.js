@@ -27,8 +27,8 @@ const { createStore } = require('./db');
 const { computeClassification, RATING_INICIAL } = require('./classification');
 const {
   TelegramGateway, INVITACION, TURNO, RECORDATORIO, PRORROGA, TIEMPO, FIN, VUELTA,
-  PAREJAS, invitacionMsg, turnoMsg, recordatorioMsg, prorrogaMsg, tiempoMsg, finMsg,
-  vueltaMsg, parejasMsg
+  PAREJAS, DESEMPATE, invitacionMsg, turnoMsg, recordatorioMsg, prorrogaMsg, tiempoMsg, finMsg,
+  vueltaMsg, parejasMsg, desempateMsg
 } = require('./telegram');
 const { crearTorneoManager } = require('./torneo');
 
@@ -643,55 +643,6 @@ function createServer(options = {}) {
     });
 
     /*
-     * Acuerdo para jugar el desempate en vivo. Cada jugador acepta desde su
-     * asiento (en la partida que acabó en tablas o ya en la sala nueva).
-     * Cuando aceptan los dos, la sala pasa a ritmo «vivo»: sin plazo y
-     * abierta a espectadores.
-     */
-    socket.on('corespon:vivo:aceptar', async (data, respond) => {
-      const room = rooms.getRoom(normalizeCode(data && data.code));
-      if (!room) return respond({ ok: false, error: 'not_found' });
-      if (room.status.over) return respond({ ok: false, error: 'game_over' });
-      if (!room.desempate && room.ritmo !== 'vivo') {
-        return respond({ ok: false, error: 'not_tiebreak' });
-      }
-
-      const ctx = socket.data && socket.data.corespon;
-      if (!ctx || !ctx.code) return respond({ ok: false, error: 'not_in_room' });
-      const origen = rooms.getRoom(ctx.code);
-      const asiento = origen && origen.players[ctx.color];
-      if (!asiento || !asiento.name) return respond({ ok: false, error: 'not_in_room' });
-
-      // El asiento de origen identifica al jugador dentro del desempate.
-      const color = room.colorForName(asiento.name);
-      if (!color) return respond({ ok: false, error: 'not_in_room' });
-
-      const result = room.aceptarVivo(color);
-      if (!result.ok) return respond(result);
-
-      await persistRoom(room);
-      io.to(room.code).emit('corespon:room:update', room.toPublic());
-
-      if (result.listo) {
-        try {
-          await torneo.marcarVivo(room.code);
-        } catch (error) {
-          if (!quiet) console.error('[corespon] No se pudo marcar el desempate en vivo:', error.message);
-        }
-        const aviso = { code: room.code, parentCode: room.parentCode || null };
-        io.to(room.code).emit('corespon:vivo:listo', aviso);
-        if (room.parentCode) io.to(room.parentCode).emit('corespon:vivo:listo', aviso);
-      }
-
-      respond({
-        ok: true,
-        code: room.code,
-        listo: result.listo,
-        vivoAceptado: result.vivoAceptado
-      });
-    });
-
-    /*
      * Vuelta del torneo. Ya no depende de votos: se crea sola al terminar la
      * partida. Este evento se mantiene para clientes con la página cacheada
      * (y como recuperación de partidas terminadas antes del cambio).
@@ -759,6 +710,27 @@ function createServer(options = {}) {
   // 1. Revisar plazos caducados → derrota por tiempo
   timers.push(setInterval(async () => {
     const now = Date.now();
+
+    // Desempates en vivo que llevan más de 24 h sin ganador: pasan a
+    // correspondencia con el plazo normal y se avisa a los dos jugadores.
+    try {
+      const vencidos = await torneo.desempatesVencidos();
+      for (const aviso of vencidos) {
+        const room = rooms.getRoom(aviso.roomCode);
+        if (!room || room.status.over) continue;
+        room.pasarACorrespondencia(now);
+        await persistRoom(room);
+        io.to(room.code).emit('corespon:room:update', room.toPublic());
+        const host = baseUrl();
+        for (const color of ['white', 'black']) {
+          gateway.enqueue(room.code, DESEMPATE, room.players[color],
+            desempateMsg(room, color, host), host);
+        }
+      }
+    } catch (error) {
+      if (!quiet) console.error('[corespon] Error pasando desempates a correspondencia:', error.message);
+    }
+
     const perdidas = rooms.checkDeadlines(now);
     for (const room of perdidas) {
       await persistRoom(room);
@@ -1785,14 +1757,16 @@ function createServer(options = {}) {
    * Crea la sala real de una partida del torneo de parejas y avisa a los dos
    * jugadores por Telegram. La usa el manager del torneo.
    */
-  async function crearSalaTorneo({ blanco, negro, ronda, ritmo, desempate, parentCode }) {
+  async function crearSalaTorneo({ blanco, negro, ronda, juego, ritmo, desempate, parentCode }) {
     const room = rooms.createRoom(blanco, negro, { ritmo, desempate, parentCode });
     await persistRoom(room);
 
+    // La ida, la vuelta y el desempate se anuncian con su nombre.
+    const etapa = juego >= 3 ? 'el desempate' : juego === 2 ? 'la vuelta' : 'la ida';
     const host = baseUrl();
     for (const color of ['white', 'black']) {
       gateway.enqueue(room.code, PAREJAS, room.players[color],
-        parejasMsg(room, color, host, { ronda }), host);
+        parejasMsg(room, color, host, { ronda, etapa }), host);
     }
     return { code: room.code, room };
   }

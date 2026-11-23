@@ -13,7 +13,7 @@ Cuadro: `/parejas` · Lobby: `/corespon`
 
 - [ ] Abrir `/parejas`.
 - [ ] Pegar los nombres en «Jugadores del sorteo, uno por línea» y crear el torneo.
-- [ ] Verificar en el cuadro: una partida por pareja, con su código y enlace.
+- [ ] Verificar en el cuadro: una **ida** por pareja, con su código y enlace. La vuelta se crea sola al terminar la ida.
 
 ## Reparto de claves (alta)
 
@@ -45,13 +45,14 @@ Cuadro: `/parejas` · Lobby: `/corespon`
 - [ ] El **plazo de 2 días** empieza cuando **los dos** jugadores han entrado en la sala.
 - [ ] Telegram avisa del turno al jugador que debe mover y del fin de partida.
 - [ ] «Partidas abiertas» ordena por plazo y agrupa: *Te toca mover*, *Esperando al rival* y *Otras partidas*.
-- [ ] **Bye (número impar):** al quedar un número impar de jugadores (con 6, en la ronda 2) comprobar que hay **una partida menos** y un jugador que **«pasa libre por sorteo»**. Ese jugador no tiene sala esa ronda y vuelve en la siguiente.
+- [ ] **Bye (número impar):** al quedar un número impar de jugadores (con 6, en la ronda 2) comprobar que hay **un cruce menos** (2 partidas menos) y un jugador que **«pasa libre por sorteo»**. Ese jugador no tiene sala esa ronda y vuelve en la siguiente.
 
-## Tablas y desempate
+## Ida, vuelta y desempate
 
-- [ ] Al acabar en tablas se crea sola la sala de desempate con los **colores cambiados**.
-- [ ] En esa sala aparece **«Jugar el desempate ahora»**. Si aceptan **los dos**, pasa a **🔴 En vivo**: sin plazo, sin prórroga y sin avisos de turno por Telegram.
-- [ ] Si no aceptan los dos, el desempate sigue como correspondencia normal (2 días).
+- [ ] Cada cruce son **dos partidas**: al terminar la ida se crea sola la **vuelta en otra sala**, con los **colores cambiados**. El cuadro muestra `Ida` y `Vuelta` con el marcador (**victoria 1 · tablas 0,5**).
+- [ ] Pasa quien más puntos tiene. Con **1–1** (una victoria cada uno o dos tablas) se crea el **desempate**, que nace **🔴 En vivo** sin que nadie tenga que aceptar: sin plazo, sin prórroga y sin avisos de turno por Telegram.
+- [ ] Las tablas en el desempate crean otra partida en vivo.
+- [ ] Si el desempate no tiene ganador en **24 h**, pasa solo a correspondencia con 2 días y llega un aviso por Telegram.
 - [ ] Espectadores: cualquier persona con el enlace puede mirar con `?ver=1` (no puede mover).
 
 ## Comprobaciones rápidas

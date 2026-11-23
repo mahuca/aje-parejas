@@ -5,10 +5,12 @@
  *
  * Reglas:
  *  - Sorteo aleatorio de parejas y de colores.
- *  - Cada pareja juega una partida. Gana quien da mate, rinde al rival o le
- *    gana al tiempo.
- *  - Si hay tablas, se repite la partida con los colores cambiados. Si vuelve
- *    a haber tablas, se sigue alternando el color hasta que alguien gane.
+ *  - Cada pareja juega dos partidas: ida y vuelta, con los colores cambiados.
+ *    La vuelta se crea al terminar la ida.
+ *  - Puntos: victoria 1, tablas 0,5. Si el marcador queda igualado después de
+ *    las dos (una victoria cada uno, o dos tablas), se juega un desempate.
+ *  - El desempate nace en vivo: sin plazo, del tirón, y se repite si vuelve a
+ *    haber tablas. Si no hay ganador en 24 h, sigue como correspondencia.
  *  - Los ganadores de la ronda se vuelven a sortear (parejas y colores) para
  *    la ronda siguiente.
  *  - Con un número impar de jugadores, uno pasa libre (bye) al azar.
@@ -29,6 +31,9 @@ const MIN_JUGADORES = 2;
 const MAX_JUGADORES = 16;
 const MAX_NOMBRE = 40;
 const ALTA_DEFAULT_HORAS = 72;
+// Tope del desempate en vivo: pasado este tiempo sin ganador, sigue como
+// correspondencia con el plazo normal.
+const DESEMPATE_VIVO_HORAS = 24;
 
 function idJugador(nombre) {
   return String(nombre || '')
@@ -92,6 +97,74 @@ function sortearParejas(nombres, rng = Math.random) {
 }
 
 /*
+ * Estado de un cruce a partir de sus partidas: ida, vuelta y desempate(s).
+ * Puntos: victoria 1, tablas 0,5. Un desempate decidido cierra el cruce; si
+ * no lo hay, el marcador de ida y vuelta decide (e igualado pide desempate).
+ *
+ * `idaVuelta` es false en los torneos antiguos (una sola partida por cruce):
+ * allí gana el primero que decida una partida.
+ *
+ * Devuelve { decidido, ganador, puntos, fase }.
+ */
+function resultadoCruce(juegos, idaVuelta = true) {
+  const orden = (juegos || []).slice().sort((a, b) => (a.juego || 1) - (b.juego || 1));
+  const ida = orden.find((p) => (p.juego || 1) === 1) || null;
+  const vuelta = orden.find((p) => p.juego === 2) || null;
+  const desempates = orden.filter((p) => (p.juego || 1) >= 3);
+
+  const puntos = {};
+  const sumar = (p) => {
+    if (p.estado === 'ganada' && p.ganador) {
+      puntos[p.ganador] = (puntos[p.ganador] || 0) + 1;
+    } else if (p.estado === 'tablas') {
+      puntos[p.blanco] = (puntos[p.blanco] || 0) + 0.5;
+      puntos[p.negro] = (puntos[p.negro] || 0) + 0.5;
+    }
+  };
+  orden.forEach(sumar);
+  // El marcador siempre existe, aunque la ida esté pendiente (0–0).
+  if (ida) {
+    puntos[ida.blanco] = puntos[ida.blanco] || 0;
+    puntos[ida.negro] = puntos[ida.negro] || 0;
+  }
+
+  // Formato antiguo: la primera partida con ganador cierra el cruce.
+  if (!idaVuelta) {
+    const ganada = orden.filter((p) => p.estado === 'ganada' && p.ganador).pop();
+    return {
+      decidido: !!ganada,
+      ganador: ganada ? ganada.ganador : null,
+      puntos,
+      fase: ganada ? (ganada.juego >= 3 ? 'desempate' : 'ida') : 'ida'
+    };
+  }
+
+  const decisivo = desempates.filter((p) => p.estado === 'ganada' && p.ganador).pop();
+  if (decisivo) {
+    return { decidido: true, ganador: decisivo.ganador, puntos, fase: 'desempate' };
+  }
+
+  const dosJugadas = !!(ida && vuelta && ida.estado !== 'pendiente' && vuelta.estado !== 'pendiente');
+  if (dosJugadas) {
+    const a = ida.blanco;
+    const b = ida.negro;
+    const pa = puntos[a] || 0;
+    const pb = puntos[b] || 0;
+    if (pa !== pb) {
+      return { decidido: true, ganador: pa > pb ? a : b, puntos, fase: 'vuelta' };
+    }
+    return { decidido: false, ganador: null, puntos, fase: 'desempate' };
+  }
+
+  return {
+    decidido: false,
+    ganador: null,
+    puntos,
+    fase: desempates.length ? 'desempate' : (ida && ida.estado !== 'pendiente' ? 'vuelta' : 'ida')
+  };
+}
+
+/*
  * Proyección pública del torneo para la API y la interfaz.
  */
 function publico(torneo) {
@@ -120,9 +193,22 @@ function publico(torneo) {
     (rondas[p.ronda] = rondas[p.ronda] || []).push(p);
   }
 
+  // Marcador y ganador de cada cruce, para pintar el cuadro.
+  const idaVuelta = torneo.formato === 'ida-vuelta';
+  const porCruce = new Map();
+  for (const p of partidas) {
+    if (!porCruce.has(p.matchId)) porCruce.set(p.matchId, []);
+    porCruce.get(p.matchId).push(p);
+  }
+  const cruces = {};
+  for (const [matchId, juegos] of porCruce) {
+    cruces[matchId] = resultadoCruce(juegos, idaVuelta);
+  }
+
   return {
     id: torneo.id,
     nombre: torneo.nombre,
+    formato: torneo.formato || 'partida-unica',
     estado: torneo.estado,
     ronda: torneo.ronda,
     creadoEn: torneo.creadoEn,
@@ -131,6 +217,7 @@ function publico(torneo) {
     campeon: torneo.campeon || null,
     partidas,
     rondas,
+    cruces,
     partidasPendientes: partidas.filter((p) => p.estado === 'pendiente').length
   };
 }
@@ -196,14 +283,14 @@ function crearTorneoManager(options = {}) {
 
   /*
    * Crea una partida nueva (sala real) y la añade al torneo.
-   * `colores` decide quién lleva blancas; si no se indica, se sortea.
+   * La ida y los desempates sortean color; la vuelta llega con los colores
+   * ya cambiados por quien llama.
    */
   async function crearPartida(torneo, { ronda, matchId, juego, a, b, ritmo, desempate, parentCode }) {
     let blanco = a;
     let negro = b;
-    // La primera partida de cada pareja sortea color. Los desempates llegan
-    // ya con los colores cambiados por quien llama.
-    if (!juego || juego === 1) {
+    const numero = juego || 1;
+    if (numero === 1 || numero >= 3) {
       if (Math.random() < 0.5) {
         blanco = b;
         negro = a;
@@ -310,6 +397,7 @@ function crearTorneoManager(options = {}) {
       const torneo = {
         id: nuevoId('t_'),
         nombre: String(nombre || 'Torneo de parejas').trim().slice(0, 60) || 'Torneo de parejas',
+        formato: 'ida-vuelta',
         estado: 'en_curso',
         ronda: 1,
         creadoEn: new Date().toISOString(),
@@ -341,6 +429,31 @@ function crearTorneoManager(options = {}) {
   }
 
   /*
+   * Desempate del cruce. Nace en vivo (sin plazo) y se repite si vuelve a
+   * haber tablas. Pasadas las primeras 24 h del desempate, los siguientes
+   * juegos van por correspondencia con el plazo normal.
+   */
+  async function crearDesempate(torneo, partida, juegos) {
+    const desempates = (juegos || []).filter((p) => (p.juego || 1) >= 3);
+    const inicio = desempates.length
+      ? Math.min(...desempates.map((p) => new Date(p.creadaEn).getTime()))
+      : Date.now();
+    const vivo = Date.now() - inicio < DESEMPATE_VIVO_HORAS * 3600 * 1000;
+    const siguienteJuego = Math.max(2, ...(juegos || []).map((p) => p.juego || 1)) + 1;
+
+    return crearPartida(torneo, {
+      ronda: partida.ronda,
+      matchId: partida.matchId,
+      juego: siguienteJuego,
+      a: partida.blanco,
+      b: partida.negro,
+      ritmo: vivo ? 'vivo' : 'correspondencia',
+      desempate: true,
+      parentCode: partida.roomCode
+    });
+  }
+
+  /*
    * Registra el final de una sala. Devuelve { gestionada: true } cuando la
    * sala pertenece al torneo (para que el servidor no cree la vuelta
    * automática del modo 1v1).
@@ -365,34 +478,62 @@ function crearTorneoManager(options = {}) {
 
       partida.finalizadaEn = new Date().toISOString();
       partida.resultado = resultado;
-
       if (resultado === 'tablas') {
         partida.estado = 'tablas';
-        // Desempate con colores cambiados; si vuelve a empatar, otra vez.
-        const siguiente = await crearPartida(torneo, {
+      } else {
+        partida.estado = 'ganada';
+        partida.ganador = resultado === 'blancas' ? partida.blanco : partida.negro;
+      }
+
+      const delCruce = () => torneo.partidas.filter(
+        (p) => p.ronda === partida.ronda && p.matchId === partida.matchId);
+
+      // 1. La ida siempre da paso a la vuelta, con los colores cambiados.
+      if ((partida.juego || 1) === 1) {
+        const vuelta = await crearPartida(torneo, {
           ronda: partida.ronda,
           matchId: partida.matchId,
-          juego: partida.juego + 1,
+          juego: 2,
           a: partida.negro,
           b: partida.blanco,
-          desempate: true,
           parentCode: room.code
         });
-        siguiente.juego = partida.juego + 1;
+        await guardar(torneo);
+        return {
+          gestionada: true,
+          tipo: 'vuelta',
+          torneo: publico(torneo),
+          nuevaPartida: vuelta.id,
+          nuevaSala: vuelta.roomCode,
+          cruce: resultadoCruce(delCruce())
+        };
+      }
+
+      // 2. Marcador igualado (o desempate en tablas): hace falta otro juego.
+      const cruce = resultadoCruce(delCruce());
+      const desempatePendiente = delCruce()
+        .some((p) => (p.juego || 1) >= 3 && p.estado === 'pendiente');
+
+      if (!cruce.decidido && !desempatePendiente) {
+        const desempate = await crearDesempate(torneo, partida, delCruce());
         await guardar(torneo);
         return {
           gestionada: true,
           tipo: 'desempate',
+          vivo: desempate.ritmo === 'vivo',
           torneo: publico(torneo),
-          nuevaPartida: siguiente.id,
-          nuevaSala: siguiente.roomCode
+          nuevaPartida: desempate.id,
+          nuevaSala: desempate.roomCode
         };
       }
 
-      partida.estado = 'ganada';
-      partida.ganador = resultado === 'blancas' ? partida.blanco : partida.negro;
+      if (!cruce.decidido) {
+        // Desempate aún en juego: el cruce no se puede cerrar.
+        await guardar(torneo);
+        return { gestionada: true, tipo: 'resultado', torneo: publico(torneo) };
+      }
 
-      // ¿Ha terminado la ronda entera?
+      // 3. ¿Ha terminado la ronda entera?
       const deLaRonda = torneo.partidas.filter((p) => p.ronda === partida.ronda);
       const matches = new Map();
       for (const p of deLaRonda) {
@@ -403,12 +544,12 @@ function crearTorneoManager(options = {}) {
       let rondaCompleta = true;
       const clasificados = [];
       for (const [, juegos] of matches) {
-        const decidido = juegos.find((j) => j.ganador);
-        if (!decidido) {
+        const resuelto = resultadoCruce(juegos);
+        if (!resuelto.decidido) {
           rondaCompleta = false;
           break;
         }
-        clasificados.push(decidido.ganador);
+        clasificados.push(resuelto.ganador);
       }
 
       // Los byes de esta ronda también pasan.
@@ -504,18 +645,37 @@ function crearTorneoManager(options = {}) {
   }
 
   /*
-   * Marca la partida del torneo como «en vivo» cuando los dos jugadores
-   * aceptan jugar el desempate del tirón. Solo cambia la etiqueta pública.
+   * Desempates en vivo que llevan más de las horas indicadas sin ganador.
+   * Marca las partidas como correspondencia y devuelve las salas que el
+   * servidor debe convertir (plazo normal de 2 días).
    */
-  async function marcarVivo(roomCode) {
+  async function desempatesVencidos(horas = DESEMPATE_VIVO_HORAS, now = Date.now()) {
     return conBloqueo(async () => {
       await cargar();
-      if (!actual) return null;
-      const partida = actual.partidas.find((p) => p.roomCode === roomCode);
-      if (!partida || partida.ritmo === 'vivo') return publico(actual);
-      partida.ritmo = 'vivo';
-      await guardar(actual);
-      return publico(actual);
+      if (!actual || actual.estado !== 'en_curso') return [];
+
+      const limite = horas * 3600 * 1000;
+      const cruces = new Map();
+      for (const p of actual.partidas) {
+        if ((p.juego || 1) < 3) continue;
+        const clave = p.ronda + ':' + p.matchId;
+        if (!cruces.has(clave)) cruces.set(clave, []);
+        cruces.get(clave).push(p);
+      }
+
+      const vencidos = [];
+      for (const [, juegos] of cruces) {
+        const inicio = Math.min(...juegos.map((p) => new Date(p.creadaEn).getTime()));
+        if (!Number.isFinite(inicio) || now - inicio < limite) continue;
+        for (const p of juegos) {
+          if (p.estado !== 'pendiente' || p.ritmo !== 'vivo') continue;
+          p.ritmo = 'correspondencia';
+          vencidos.push({ roomCode: p.roomCode, matchId: p.matchId, ronda: p.ronda });
+        }
+      }
+
+      if (vencidos.length) await guardar(actual);
+      return vencidos;
     });
   }
 
@@ -523,7 +683,7 @@ function crearTorneoManager(options = {}) {
     cargar,
     crearTorneo,
     alTerminar,
-    marcarVivo,
+    desempatesVencidos,
     esSalaDeTorneo,
     obtenerActual,
     obtener,
@@ -536,10 +696,12 @@ function crearTorneoManager(options = {}) {
 module.exports = {
   crearTorneoManager,
   sortearParejas,
+  resultadoCruce,
   limpiarNombres,
   publico,
   idJugador,
   MIN_JUGADORES,
   MAX_JUGADORES,
-  ALTA_DEFAULT_HORAS
+  ALTA_DEFAULT_HORAS,
+  DESEMPATE_VIVO_HORAS
 };

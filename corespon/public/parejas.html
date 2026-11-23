@@ -105,6 +105,13 @@
     .partida .jugador + .jugador { border-top: 1px solid var(--borde); }
     .partida .jugador.ganador { color: var(--verde); font-weight: 700; }
     .partida .color { font-size: 12px; color: var(--suave); }
+    .partida .marcador { font-size: 15px; font-weight: 700; color: var(--texto); }
+    .partida .juegos {
+      display: grid; gap: 5px; padding: 8px 13px;
+      border-top: 1px dashed var(--borde); font-size: 12px; color: var(--suave);
+    }
+    .partida .juegos .fila { display: flex; flex-wrap: wrap; gap: 4px 8px; justify-content: space-between; }
+    .partida .juegos a { color: var(--azul); font-weight: 600; text-decoration: none; }
     .partida .pie {
       display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
       padding: 8px 13px 11px; border-top: 1px dashed var(--borde); font-size: 13px;
@@ -175,7 +182,7 @@
       <div class="cabecera-torneo">
         <div>
           <h2>Torneo knockout de parejas</h2>
-          <p class="ayuda">Sorteo aleatorio de parejas y colores. Gana quien vence la partida; si hay tablas se repite con los colores cambiados. Los ganadores se vuelven a emparejar al azar hasta que quede el campeón.</p>
+          <p class="ayuda">Sorteo aleatorio de parejas y colores. Cada cruce son <strong>dos partidas</strong> (ida y vuelta, con los colores cambiados): victoria 1 punto, tablas 0,5. Si queda igualado se juega un <strong>desempate en vivo</strong> (24 h para jugarlo; si no, pasa a correspondencia). Los ganadores se vuelven a emparejar al azar hasta que quede el campeón.</p>
         </div>
         <span id="estadoTorneo" class="chip">Sin torneo</span>
       </div>

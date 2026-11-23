@@ -75,42 +75,53 @@ function agruparPorMatch(partidas) {
   return grupos;
 }
 
-function tarjetaPartida(grupo) {
-  const p = grupo.actual;
-  const ganador = grupo.juegos.find((j) => j.ganador);
-  const nombreGanador = ganador ? ganador.ganador : null;
+function puntosTexto(valor) {
+  return Number.isInteger(valor) ? String(valor) : String(valor).replace('.', ',');
+}
 
-  const claseBlanco = nombreGanador && nombreGanador === p.blanco ? 'ganador' : '';
-  const claseNegro = nombreGanador && nombreGanador === p.negro ? 'ganador' : '';
+function nombreJuego(juego) {
+  if (juego >= 3) return 'Desempate ' + (juego - 2);
+  return juego === 2 ? 'Vuelta' : 'Ida';
+}
 
-  let estado = 'Pendiente';
-  let claseEstado = '';
-  if (nombreGanador) {
-    estado = 'Ganó ' + nombreGanador;
-    claseEstado = 'ganada';
-  } else if (p.estado === 'tablas') {
-    estado = 'Tablas · desempate';
-    claseEstado = 'tablas';
-  }
+function tarjetaPartida(grupo, torneo) {
+  const cruce = ((torneo && torneo.cruces) || {})[grupo.matchId] || {};
+  const primera = grupo.juegos[0];
+  const a = primera.blanco;
+  const b = primera.negro;
+  const puntos = cruce.puntos || {};
+  const ganador = cruce.decidido ? cruce.ganador : null;
 
-  const desempate = p.juego > 1 ? ' · desempate ' + (p.juego - 1) : '';
-  const vivo = p.ritmo === 'vivo' ? ' <span class="badge-vivo">🔴 En vivo</span>' : '';
-  const enlace = !nombreGanador
-    ? `<span class="acciones-partida"><a href="${esc(p.enlace)}">Abrir partida →</a>`
-      + `<a class="ver" href="${esc(p.enlace)}?ver=1">Ver</a></span>`
-    : `<a class="ver" href="${esc(p.enlace)}?ver=1">Ver →</a>`;
+  const filas = grupo.juegos.map((p) => {
+    const vivo = p.ritmo === 'vivo'
+      ? ' <span class="badge-vivo">🔴 En vivo</span>' : '';
+    const estado = p.estado === 'pendiente' ? 'pendiente'
+      : p.estado === 'tablas' ? 'tablas'
+        : 'ganó ' + (p.ganador || '');
+    const enlace = p.estado === 'pendiente'
+      ? `<a href="${esc(p.enlace)}">jugar →</a>`
+      : `<a class="ver" href="${esc(p.enlace)}?ver=1">ver</a>`;
+    return `<div class="fila">
+      <span>${nombreJuego(p.juego)} · ${esc(p.blanco)} vs ${esc(p.negro)}</span>
+      <span>${esc(estado)}${vivo} ${enlace}</span>
+    </div>`;
+  }).join('');
+
+  const estadoCruce = ganador
+    ? 'Gana ' + ganador
+    : cruce.fase === 'desempate' ? 'Desempate' : 'En juego';
 
   return `
     <article class="partida">
-      <div class="jugador ${claseBlanco}">
-        <span>${esc(p.blanco)}</span><span class="color">♔ blancas</span>
+      <div class="jugador ${ganador === a ? 'ganador' : ''}">
+        <span>${esc(a)}</span><span class="marcador">${puntosTexto(puntos[a] || 0)}</span>
       </div>
-      <div class="jugador ${claseNegro}">
-        <span>${esc(p.negro)}</span><span class="color">♚ negras</span>
+      <div class="jugador ${ganador === b ? 'ganador' : ''}">
+        <span>${esc(b)}</span><span class="marcador">${puntosTexto(puntos[b] || 0)}</span>
       </div>
+      <div class="juegos">${filas}</div>
       <div class="pie">
-        <span class="estado-p ${claseEstado}">${esc(estado)}${esc(desempate)}${vivo}</span>
-        ${enlace}
+        <span class="estado-p ${ganador ? 'ganada' : ''}">${esc(estadoCruce)}</span>
       </div>
     </article>`;
 }
@@ -137,7 +148,8 @@ function pintarCuadro(torneo) {
 
     html += `<div class="ronda"><h3>${esc(nombreRonda(ronda, totalRondas))}</h3>`;
     if (grupos.length) {
-      html += '<div class="partidas">' + grupos.map(tarjetaPartida).join('') + '</div>';
+      html += '<div class="partidas">'
+        + grupos.map((g) => tarjetaPartida(g, torneo)).join('') + '</div>';
     }
     for (const bye of byes) {
       html += `<p class="bye">Sin rival (número impar): ${esc(bye.nombre)} ${textoBye(bye)}.</p>`;
@@ -201,17 +213,18 @@ function pintarSorteo(torneo) {
   }
 
   const ronda = torneo.ronda;
-  const partidas = (torneo.rondas[ronda] || []).filter((p) => (p.juego || 1) === 1);
+  const partidas = (torneo.rondas[ronda] || []);
   const byes = (torneo.byes || []).filter((b) => Number(b.ronda) === ronda);
   if (!partidas.length && !byes.length) {
     caja.innerHTML = '';
     return;
   }
 
-  const filas = partidas.map((p) => `
+  // Un bloque por cruce: ida, vuelta y desempates en orden.
+  const filas = agruparPorMatch(partidas).flatMap((grupo) => grupo.juegos).map((p) => `
     <div class="emparejamiento">
-      <span>${esc(p.blanco)} <span class="vs">vs</span> ${esc(p.negro)}</span>
-      <span class="color">${esc(p.blanco)} lleva blancas</span>
+      <span>${nombreJuego(p.juego)} · ${esc(p.blanco)} <span class="vs">vs</span> ${esc(p.negro)}</span>
+      <span class="color">${esc(p.blanco)} lleva blancas${p.ritmo === 'vivo' ? ' · 🔴 en vivo' : ''}</span>
     </div>`).join('');
 
   const libres = byes.map((b) => `
@@ -344,10 +357,13 @@ async function buscarJugador() {
       const rival = p.blanco.toLowerCase() === nombre.toLowerCase() ? p.negro : p.blanco;
       const color = p.blanco.toLowerCase() === nombre.toLowerCase() ? 'blancas' : 'negras';
       let estado = 'Pendiente';
-      if (p.ganador) estado = p.ganador.toLowerCase() === nombre.toLowerCase() ? 'Ganada' : 'Perdida';
-      else if (p.estado === 'tablas') estado = 'Tablas · desempate';
+      if (p.ganador) {
+        estado = p.ganador.toLowerCase() === nombre.toLowerCase() ? 'Ganada' : 'Perdida';
+      } else if (p.estado === 'tablas') {
+        estado = p.juego >= 3 ? 'Tablas · sigue el desempate' : 'Tablas';
+      }
       return `<div class="fila-juego">
-        <span>Ronda ${p.ronda} · contra <strong>${esc(rival)}</strong> con ${color}${p.juego > 1 ? ' · desempate' : ''}</span>
+        <span>Ronda ${p.ronda} · ${nombreJuego(p.juego)} · contra <strong>${esc(rival)}</strong> con ${color}</span>
         <span>${esc(estado)}${p.ganador ? '' : ' · <a href="' + esc(p.enlace) + '">jugar →</a>'} · <a href="${esc(p.enlace)}?ver=1">ver</a></span>
       </div>`;
     }).join('');
